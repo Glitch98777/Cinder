@@ -514,9 +514,13 @@ class Session(app: Application) : AndroidViewModel(app) {
             }
 
             is Event.Notice -> {
-                if (event.isError) busy = false
+                // Only a genuine engine-death should end the turn — the exit notice carries that.
+                if (event.isError && event.text.startsWith("Could not start")) busy = false
                 transcript.add(Turn.Notice(event.text, event.isError))
             }
+
+            // stderr chatter: show it, but never let it flip busy and kill the stop button
+            is Event.Stderr -> transcript.add(Turn.Notice(event.text, isError = false))
         }
     }
 

@@ -556,18 +556,27 @@ private fun ToolCard(tool: Turn.Tool) {
                     Text(tool.name, color = Text0, fontFamily = mono, fontSize = 12.sp, fontWeight = FontWeight.Bold)
                     Text(tool.headline, color = Dim, fontFamily = mono, fontSize = 12.sp, maxLines = 1)
                 }
-                // Live status for anything producing a file — Write/Edit, or a Bash redirect.
-                if (tool.name in setOf("Write", "Edit", "NotebookEdit") || tool.lines != null) {
+                // Live status for anything touching a file — Read, Write/Edit, or a Bash redirect.
+                val writes = tool.name in setOf("Write", "Edit", "NotebookEdit")
+                val reads = tool.name == "Read"
+                if (writes || reads || tool.lines != null) {
                     val lines = tool.lines
                     Text(
                         when {
+                            reads && !tool.finished -> "reading file…"
+                            reads && tool.failed -> "read failed"
+                            reads && lines != null -> "read file · $lines lines"
+                            reads -> "read file"
                             !tool.finished && lines != null -> "creating file · $lines lines written"
                             !tool.finished -> "creating file…"
                             tool.failed -> "write failed"
                             lines != null -> "file created · $lines lines"
                             else -> "file created"
                         },
-                        color = if (tool.finished && !tool.failed) Green else if (tool.failed) Red else Blue,
+                        color = if (tool.failed) Red
+                        else if (reads) Blue
+                        else if (tool.finished) Green
+                        else Blue,
                         fontFamily = mono, fontSize = 10.sp,
                         modifier = Modifier.padding(top = 2.dp)
                     )

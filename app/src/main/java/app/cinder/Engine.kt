@@ -61,8 +61,10 @@ sealed interface Event {
     data class Init(
         val model: String?, val cwd: String?, val tools: List<String>, val sessionId: String?
     ) : Event
-    /** Anything the bridge itself needs to say — startup, crashes, stderr. */
+    /** Anything the bridge itself needs to say — startup, crashes. */
     data class Notice(val text: String, val isError: Boolean = false) : Event
+    /** A stderr line from the engine — shown for visibility, but never ends the turn. */
+    data class Stderr(val text: String) : Event
 }
 
 class Engine(private val sandbox: Sandbox, private val scope: CoroutineScope) {
@@ -139,7 +141,13 @@ class Engine(private val sandbox: Sandbox, private val scope: CoroutineScope) {
         scope.launch(Dispatchers.IO) {
             runCatching {
                 BufferedReader(InputStreamReader(p.errorStream)).forEachLine { line ->
-                    if (line.isNotBlank()) onEvent(Event.Notice(line, isError = true))
+                    // proot prints harmless "can't sanitize binding" warnings to stderr on every
+                    // spawn; they are noise, not turn-ending errors, so drop them entirely.
+                    if (line.isNotBlank() && !line.contains("proot warning") &&
+                        !line.contains("can't sanitize") && !line.contains("linkerconfig")
+                    ) {
+                        onEvent(Event.Stderr(line))
+                    }
                 }
             }
         }
