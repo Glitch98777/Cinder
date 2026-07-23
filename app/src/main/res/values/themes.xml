@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="Theme.ClaudeCode" parent="android:Theme.Material.NoActionBar">
+        <item name="android:statusBarColor">#15130F</item>
+        <item name="android:navigationBarColor">#1D1A15</item>
+        <item name="android:windowBackground">#15130F</item>
+    </style>
+</resources>
