@@ -320,10 +320,26 @@ private fun TurnRow(turn: Turn) {
             SelectionContainer { Text(turn.text, color = Text0, fontSize = 13.sp, lineHeight = 19.sp) }
         }
 
-        is Turn.Assistant -> Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                Text("⏺", color = Orange, fontSize = 12.sp, modifier = Modifier.padding(top = 3.dp))
-                SelectionContainer { Text(turn.text, color = Text0, fontSize = 13.sp, lineHeight = 20.sp) }
+        is Turn.Assistant -> Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            val parts = remember(turn.text) { splitFences(turn.text) }
+            parts.forEachIndexed { i, part ->
+                when (part) {
+                    is Part.Prose -> if (part.text.isNotBlank()) Row(
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        // only the first prose block carries the marker; the rest continue it
+                        Text(
+                            if (i == 0) "⏺" else " ",
+                            color = Orange, fontSize = 12.sp,
+                            modifier = Modifier.padding(top = 3.dp)
+                        )
+                        SelectionContainer {
+                            Text(part.text, color = Text0, fontSize = 13.sp, lineHeight = 20.sp)
+                        }
+                    }
+
+                    is Part.Code -> CodeCanvas(part)
+                }
             }
             FileChips(turn.text)
         }
@@ -384,6 +400,91 @@ private fun TurnRow(turn: Turn) {
         is Turn.Done -> Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             Text("⎿", color = Dim, fontFamily = mono, fontSize = 12.sp)
             Text(turn.summary, color = Dim, fontFamily = mono, fontSize = 11.sp)
+        }
+    }
+}
+
+/** A message splits into prose and fenced code; the code gets its own canvas. */
+private sealed interface Part {
+    data class Prose(val text: String) : Part
+    data class Code(val language: String, val code: String, val open: Boolean) : Part
+}
+
+/**
+ * Splits on ``` fences. A canvas opens at the opening fence and closes at the closing one — and if
+ * a message ends mid-block (the closing fence never arrives), the canvas stays open rather than
+ * spilling code into the prose.
+ */
+private fun splitFences(text: String): List<Part> {
+    val parts = mutableListOf<Part>()
+    val lines = text.lines()
+    val buf = StringBuilder()
+    var inCode = false
+    var lang = ""
+    var closed = true
+
+    fun flushProse() {
+        if (buf.isNotEmpty()) { parts.add(Part.Prose(buf.toString().trimEnd('\n'))); buf.clear() }
+    }
+
+    for (line in lines) {
+        val fence = line.trimStart().startsWith("```")
+        if (fence && !inCode) {
+            flushProse()
+            inCode = true; closed = false
+            lang = line.trimStart().removePrefix("```").trim()
+        } else if (fence && inCode) {
+            parts.add(Part.Code(lang, buf.toString().trimEnd('\n'), open = false))
+            buf.clear(); inCode = false; closed = true
+        } else {
+            buf.appendLine(line)
+        }
+    }
+    if (inCode) parts.add(Part.Code(lang, buf.toString().trimEnd('\n'), open = !closed))
+    else flushProse()
+    return parts
+}
+
+@Composable
+private fun CodeCanvas(part: Part.Code) {
+    val clipboard = androidx.compose.ui.platform.LocalClipboardManager.current
+    var copied by remember { mutableStateOf(false) }
+    val lineCount = remember(part.code) { part.code.lines().size }
+
+    Column(
+        Modifier.fillMaxWidth().clip(RoundedCornerShape(5.dp))
+            .background(Ink).border(1.dp, Line, RoundedCornerShape(5.dp))
+    ) {
+        Row(
+            Modifier.fillMaxWidth().background(Panel).padding(horizontal = 10.dp, vertical = 6.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            Text(
+                part.language.ifBlank { "code" },
+                color = Orange, fontFamily = mono, fontSize = 10.sp
+            )
+            Text("$lineCount lines", color = Dim, fontFamily = mono, fontSize = 9.sp)
+            if (part.open) Text("writing…", color = Blue, fontFamily = mono, fontSize = 9.sp)
+            Spacer(Modifier.weight(1f))
+            Text(
+                if (copied) "copied" else "copy",
+                color = if (copied) Green else Dim, fontFamily = mono, fontSize = 10.sp,
+                modifier = Modifier.clip(RoundedCornerShape(3.dp))
+                    .clickable {
+                        clipboard.setText(androidx.compose.ui.text.AnnotatedString(part.code))
+                        copied = true
+                    }
+                    .padding(horizontal = 6.dp, vertical = 2.dp)
+            )
+        }
+        SelectionContainer {
+            Text(
+                part.code,
+                color = Text0, fontFamily = mono, fontSize = 11.sp, lineHeight = 16.sp,
+                softWrap = false,
+                modifier = Modifier.horizontalScroll(rememberScrollState()).padding(10.dp)
+            )
         }
     }
 }
