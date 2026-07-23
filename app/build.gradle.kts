@@ -5,11 +5,11 @@ plugins {
 }
 
 android {
-    namespace = "app.claudecodemobile"
+    namespace = "app.cinder"
     compileSdk = 36
 
     defaultConfig {
-        applicationId = "app.claudecodemobile"
+        applicationId = "app.cinder"
         minSdk = 30
         // Deliberately 28: apps targeting API 29+ cannot exec binaries out of their own
         // writable data directory, which is exactly what the sandbox needs to do. Termux

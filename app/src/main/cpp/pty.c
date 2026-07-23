@@ -36,7 +36,7 @@ static void free_c_array(char **a) {
 }
 
 JNIEXPORT jint JNICALL
-Java_app_claudecodemobile_Pty_spawn(JNIEnv *env, jclass clazz, jobjectArray argvArr,
+Java_app_cinder_Pty_spawn(JNIEnv *env, jclass clazz, jobjectArray argvArr,
                                     jobjectArray envpArr, jstring cwdStr, jint rows, jint cols,
                                     jintArray pidOut) {
     char **argv = to_c_array(env, argvArr);
@@ -77,7 +77,7 @@ Java_app_claudecodemobile_Pty_spawn(JNIEnv *env, jclass clazz, jobjectArray argv
 }
 
 JNIEXPORT jint JNICALL
-Java_app_claudecodemobile_Pty_waitFor(JNIEnv *env, jclass clazz, jint pid) {
+Java_app_cinder_Pty_waitFor(JNIEnv *env, jclass clazz, jint pid) {
     int status = 0;
     if (waitpid((pid_t) pid, &status, 0) < 0) return -1;
     if (WIFEXITED(status)) return WEXITSTATUS(status);
@@ -86,13 +86,13 @@ Java_app_claudecodemobile_Pty_waitFor(JNIEnv *env, jclass clazz, jint pid) {
 }
 
 JNIEXPORT void JNICALL
-Java_app_claudecodemobile_Pty_killPid(JNIEnv *env, jclass clazz, jint pid) {
+Java_app_cinder_Pty_killPid(JNIEnv *env, jclass clazz, jint pid) {
     kill((pid_t) pid, SIGHUP);
     kill((pid_t) pid, SIGTERM);
 }
 
 JNIEXPORT void JNICALL
-Java_app_claudecodemobile_Pty_resize(JNIEnv *env, jclass clazz, jint fd, jint rows, jint cols) {
+Java_app_cinder_Pty_resize(JNIEnv *env, jclass clazz, jint fd, jint rows, jint cols) {
     struct winsize ws;
     memset(&ws, 0, sizeof(ws));
     ws.ws_row = (unsigned short) rows;

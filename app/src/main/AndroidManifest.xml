@@ -6,16 +6,16 @@
 
     <application
         android:allowBackup="false"
-        android:label="Claude Code"
+        android:label="Cinder"
         android:icon="@mipmap/ic_launcher"
         android:supportsRtl="true"
-        android:theme="@style/Theme.ClaudeCode">
+        android:theme="@style/Theme.Cinder">
 
         <activity
             android:name=".MainActivity"
             android:exported="true"
             android:windowSoftInputMode="adjustResize"
-            android:theme="@style/Theme.ClaudeCode">
+            android:theme="@style/Theme.Cinder">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />

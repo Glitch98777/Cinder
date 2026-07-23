@@ -1,4 +1,4 @@
-package app.claudecodemobile
+package app.cinder
 
 import android.os.ParcelFileDescriptor
 import java.io.FileInputStream

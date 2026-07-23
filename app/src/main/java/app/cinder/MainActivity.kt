@@ -1,4 +1,4 @@
-package app.claudecodemobile
+package app.cinder
 
 import android.net.Uri
 import android.os.Bundle
@@ -32,13 +32,13 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.launch
 
-// Claude Code's terminal palette: near-black ground, the orange ⏺ marker, muted chrome.
+// Cinder's palette: near-black ground, an ember accent, muted chrome.
 private val Ink = Color(0xFF15130F)
 private val Panel = Color(0xFF1D1A15)
 private val Line = Color(0xFF2E2A23)
 private val Text0 = Color(0xFFE8E3D9)
 private val Dim = Color(0xFF8A8377)
-private val Orange = Color(0xFFD97757)
+private val Orange = Color(0xFFE0603A)   // ember
 private val Green = Color(0xFF7FB069)
 private val Red = Color(0xFFD9534F)
 private val Blue = Color(0xFF6C9BD1)
@@ -111,7 +111,7 @@ private fun HistoryPane(vm: Session, onOpen: (SessionRecord) -> Unit) {
         verticalArrangement = Arrangement.spacedBy(10.dp)
     ) {
         Row(verticalAlignment = Alignment.CenterVertically) {
-            Text("✻", color = Orange, fontSize = 14.sp)
+            Text("✦", color = Orange, fontSize = 14.sp)
             Spacer(Modifier.width(8.dp))
             Text("sessions", color = Text0, fontFamily = mono, fontSize = 14.sp, fontWeight = FontWeight.Bold)
             Spacer(Modifier.weight(1f))
@@ -189,8 +189,8 @@ private fun Header(vm: Session, tab: Tab, onMenu: () -> Unit, onTab: (Tab) -> Un
                 modifier = Modifier.clip(RoundedCornerShape(4.dp)).clickable { onMenu() }
                     .padding(horizontal = 4.dp, vertical = 2.dp)
             )
-            Text("✻", color = Orange, fontSize = 18.sp)
-            Text("claude code", color = Text0, fontSize = 16.sp, fontFamily = mono, fontWeight = FontWeight.Bold)
+            Text("✦", color = Orange, fontSize = 18.sp)
+            Text("cinder", color = Text0, fontSize = 16.sp, fontFamily = mono, fontWeight = FontWeight.Bold)
             Spacer(Modifier.weight(1f))
             Text(vm.status, color = if (vm.busy) Orange else Dim, fontSize = 11.sp, fontFamily = mono)
             Surface(
@@ -303,7 +303,7 @@ private fun ChatTab(vm: Session) {
 @Composable
 private fun Welcome() {
     Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-        Text("✻ Welcome to Claude Code", color = Orange, fontFamily = mono, fontSize = 13.sp)
+        Text("✦ Cinder — a mobile Claude Code client", color = Orange, fontFamily = mono, fontSize = 13.sp)
         Text(
             "This app carries its own sandbox: a private Linux workspace where files are created, " +
                 "edited and built. The shell tab works right now. The agent needs its engine — see setup.",

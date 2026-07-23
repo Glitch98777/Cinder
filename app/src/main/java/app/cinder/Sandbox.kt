@@ -1,4 +1,4 @@
-package app.claudecodemobile
+package app.cinder
 
 import android.content.Context
 import kotlinx.coroutines.Dispatchers

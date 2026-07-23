@@ -1,4 +1,4 @@
-package app.claudecodemobile
+package app.cinder
 
 import android.app.Application
 import android.net.Uri

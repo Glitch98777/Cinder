@@ -1,4 +1,6 @@
-# Claude Code Mobile
+# Cinder
+
+**A mobile Claude Code client.**
 
 An Android client that runs the **real** Claude Code CLI on a phone — not a reimplementation, not a
 remote shell, not a web wrapper. The official `claude` binary executes inside a self-contained Linux
@@ -26,6 +28,7 @@ registry on demand.
 
 ## Features
 
+- **Code canvas** — fenced code blocks render as scrollable panels with a copy button
 - **Chat transcript** in Claude Code's visual language — `⏺` markers, per-tool cards, `Edit` diffs,
   collapsible results, `⎿` result gutters
 - **Live file-creation status** — `creating file · 84 lines written` → `file created · 212 lines`,
@@ -129,8 +132,8 @@ That is a genuine `ecj → d8 → aapt2 → apksigner` pipeline running on the p
 ## Building
 
 ```sh
-git clone https://github.com/<owner>/ClaudeCodeMobile
-cd ClaudeCodeMobile
+git clone https://github.com/<owner>/Cinder
+cd Cinder
 ./gradlew assembleDebug
 adb install -r app/build/outputs/apk/debug/app-debug.apk
 ```
