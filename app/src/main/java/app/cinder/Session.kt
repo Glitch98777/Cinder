@@ -1022,16 +1022,17 @@ class Session(app: Application) : AndroidViewModel(app) {
     fun installTools(extra: String = ""): kotlinx.coroutines.Job {
         if (!sandbox.engineReady) { log("engine not ready"); return viewModelScope.launch { } }
         return viewModelScope.launch(Dispatchers.IO) {
-            // fakeroot is what lets the unprivileged agent run apk itself afterwards; dpkg/unzip
-            // are what termux-install and the SDK installer need.
+            // Real apk (elevated via nested proot -0) pulls full dependency trees; dpkg/unzip are
+            // for termux-install and the SDK installer. No fakeroot — it needs SysV IPC, absent here.
             val packages = ("bash coreutils findutils grep sed git ripgrep less " +
-                "python3 py3-pip nodejs npm curl wget unzip tar xz fakeroot dpkg $extra").trim()
+                "python3 py3-pip nodejs npm curl wget unzip tar xz dpkg $extra").trim()
             log("apk add $packages …")
             runCatching {
-                // alpine-install downloads and unpacks packages directly. Real apk is unusable on
-                // Android (SysV IPC is absent from the kernel), and this needs no root either.
+                // Runs under proot -0 (asRoot), where real apk extracts full dependency trees.
+                // The trailing "database inconsistent" error is cosmetic — files are already down.
                 val p = sandbox.spawn(
-                    "rm -f /lib/apk/db/lock; /usr/local/bin/alpine-install $packages 2>&1 | tail -40",
+                    "rm -f /lib/apk/db/lock; /sbin/apk add --no-cache $packages 2>&1 " +
+                        "| grep -v 'System state may be inconsistent' | tail -40",
                     asRoot = true
                 )
                 java.io.BufferedReader(java.io.InputStreamReader(p.inputStream))
@@ -1040,7 +1041,7 @@ class Session(app: Application) : AndroidViewModel(app) {
                     .forEachLine { if (it.isNotBlank() && !it.contains("sanitize")) log("  ! ${it.trim()}") }
                 p.waitFor()
             }.onFailure { log("apk failed: ${it.message}") }
-            log(if (sandbox.hasBash) "bash installed — POSIX shell ready" else "bash still missing")
+            log(if (sandbox.hasBash) "shell + tools ready" else "bash still missing")
             refreshInstalls()
         }
     }
@@ -1117,6 +1118,26 @@ class Session(app: Application) : AndroidViewModel(app) {
             }.onFailure { log("build tools failed: ${it.message}") }
             withContext(Dispatchers.Main) { buildToolsInstalling = false }
             refreshInstalls()
+        }
+    }
+
+    var apkToolsInstalling by mutableStateOf(false)
+        private set
+
+    /** apktool, jadx, dex2jar, aapt2, apksigner and a JDK — everything for taking an APK apart. */
+    fun installApkTools() {
+        if (!sandbox.engineReady) { log("engine not ready"); return }
+        if (apkToolsInstalling) return
+        apkToolsInstalling = true
+        viewModelScope.launch(Dispatchers.IO) {
+            log("--- apk tools ---")
+            runCatching {
+                val p = sandbox.spawn("/usr/local/bin/apk-tools-install 2>&1", asRoot = true)
+                java.io.BufferedReader(java.io.InputStreamReader(p.inputStream))
+                    .forEachLine { if (it.isNotBlank()) log("  ${it.trim()}") }
+                p.waitFor()
+            }.onFailure { log("apk tools failed: ${it.message}") }
+            withContext(Dispatchers.Main) { apkToolsInstalling = false }
         }
     }
 

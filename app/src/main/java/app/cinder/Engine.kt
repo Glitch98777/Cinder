@@ -27,14 +27,20 @@ import java.io.OutputStreamWriter
 private val SANDBOX_BRIEF = listOf(
     "You are running on an Android phone inside an Alpine Linux (musl, aarch64) sandbox under proot.",
     "The working directory /workspace is writable and persistent; /root is your home.",
-    "System packages: apk add <pkg>, apk del <pkg>, apk info (lists installed), apk update.",
-    "Real apk cannot run here — Android's kernel has no SysV IPC — so those commands are shims that " +
-        "download and unpack Alpine packages directly. They need no root and behave the same.",
+    "System packages: apk add <pkg> / apk del <pkg>. These run real apk elevated via nested proot, " +
+        "so full dependency trees install. You'll see a harmless 'database inconsistent' note at the " +
+        "end — ignore it, the files are already installed and work.",
     "npm install -g works: the prefix is /root/.npm-global, already on PATH.",
     "pip install works: it installs to /root/.local (PIP_USER is set), also on PATH. Use python3/pip3.",
     "If a language runtime is missing, install it first: apk add nodejs npm python3 py3-pip openjdk17 go rust.",
     "Android build tools are NOT in Alpine, and Google's SDK/NDK are x86-64 only so they cannot run here.",
     "Use termux-install <pkg> for Android/aarch64 builds of them: termux-install aapt2 d8 apksigner openjdk-17.",
+    "To take an APK apart: apktool d <apk> (smali + resources), jadx <apk> (Java source).",
+    "baksmali <apk> [out] and smali <dir> [out.apk] are shims onto apktool, which embeds both.",
+    "If those are missing, run apk-tools-install once — it installs Alpine's JDK and the jars.",
+    "Important: Termux/Android binaries generally cannot run in this rootfs — their ELF interpreter " +
+        "is /system/bin/linker64, a symlink into /apex that isn't reliably visible here. Prefer " +
+        "Alpine packages (apk add) and pure-Java tools, which run on the musl JVM.",
     "Those land in /data/data/com.termux/files/usr and are already on PATH. Cross-compilers: termux-install clang binutils make cmake.",
     "Android's own tools are on PATH too (getprop, pm, am, dumpsys) since /system is mounted.",
     "Files you create in /workspace can be opened by the user from the app, so mention their paths."

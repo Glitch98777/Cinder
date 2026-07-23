@@ -199,8 +199,17 @@ class Sandbox(private val ctx: Context) {
             // A JVM under proot trips over three things by default: it maps a shared class-data
             // archive at a fixed address, writes perf data into /tmp/hsperfdata, and sizes its
             // heap from the device's total RAM rather than what this process may actually get.
-            append("export JAVA_TOOL_OPTIONS=\"-XX:-UsePerfData -Xshare:off ")
-            append("-XX:MaxRAMPercentage=25 -Djava.io.tmpdir=/tmp\"; ")
+            // -Xshare:off      : the CDS archive maps at a fixed address proot won't honour
+            // -UsePerfData     : hsperfdata needs working shared memory
+            // UseSerialGC      : G1 reserves large regions up front and fails under proot
+            // CompressedClassSpaceSize: the default 1 GB reservation is refused
+            // -Xmx512m         : the JVM sizes the heap from total RAM, then can't reserve it
+            append("export JAVA_TOOL_OPTIONS=\"-XX:-UsePerfData -Xshare:off -XX:+UseSerialGC ")
+            append("-XX:CompressedClassSpaceSize=64m -Xms16m -Xmx512m -Djava.io.tmpdir=/tmp\"; ")
+            // Alpine's JVM, not Termux's: a musl-native HotSpot that JITs, rather than an Android
+            // binary that can't find its loader in here.
+            append("export JAVA_HOME=/usr/lib/jvm/default-jvm; ")
+            append("export PATH=\$PATH:/usr/lib/jvm/default-jvm/bin:/usr/local/jadx/bin; ")
             append("unset LD_LIBRARY_PATH; export HOME=/root TMPDIR=/tmp SHELL=$shell; ")
             // npm -g and pip both want to write to system dirs, which the unprivileged agent
             // can't touch. Point them at the home directory instead so installs just work.
@@ -242,19 +251,44 @@ class Sandbox(private val ctx: Context) {
      * apk needs to write to the rootfs. This wrapper re-enters the same filesystem through a
      * nested proot with `-0`, so package installs work without the agent itself being root.
      */
+    /** Termux scripts expect a shell at Termux's own prefix; give them one. */
+    fun linkTermuxShell() {
+        val prefixBin = File(rootfs, "data/data/com.termux/files/usr/bin")
+        if (!prefixBin.exists()) return
+        val shell = File(rootfs, "bin/sh")
+        listOf("sh", "env", "bash").forEach { name ->
+            val link = File(prefixBin, name)
+            if (!link.exists() && shell.exists()) {
+                val target = when {
+                    name == "bash" && File(rootfs, "bin/bash").exists() -> "/bin/bash"
+                    name == "env" -> "/usr/bin/env"
+                    else -> "/bin/sh"
+                }
+                runCatching { android.system.Os.symlink(target, link.absolutePath) }
+            }
+        }
+    }
+
     fun writeHelpers() {
         ensureLayout()
+        linkTermuxShell()
         val sudo = File(bin, "sudo")
         sudo.writeText(
             """
             #!/bin/sh
-            # No device root is involved anywhere here. Every file in this rootfs is already owned
-            # by the app's own uid, so writes succeed — the only obstacle is that apk refuses to
-            # run unless it believes it is uid 0. fakeroot is an LD_PRELOAD shim that says so.
-            if command -v fakeroot >/dev/null 2>&1; then
-              exec fakeroot -- "${'$'}@"
-            fi
-            exec "${'$'}@"
+            # Fake root by re-entering the rootfs through a nested proot -0. This is the only
+            # elevation that works on Android: fakeroot needs a SysV-IPC daemon (absent from the
+            # kernel), and the files are already ours anyway — apk only refuses to run unless it
+            # believes it is uid 0, which -0 provides. Verified: real apk then installs full
+            # dependency trees and the musl JVM runs.
+            mkdir -p /tmp
+            PROOT_LOADER=/usr/local/libexec/loader \
+            PROOT_LOADER_32=/usr/local/libexec/loader32 \
+            PROOT_TMP_DIR=/tmp \
+            LD_LIBRARY_PATH=/usr/local/androidlib \
+            exec /usr/local/bin/proot -0 -r / \
+              -b /system:/system -b /apex:/apex -b /proc:/proc -b /dev:/dev -b /sys:/sys \
+              -w "${'$'}PWD" "${'$'}@"
             """.trimIndent() + "\n"
         )
         sudo.setExecutable(true, false)
@@ -389,21 +423,15 @@ class Sandbox(private val ctx: Context) {
         apkShim.writeText(
             """
             #!/bin/sh
-            # Real apk cannot run on Android: apk-tools v3 locks its database with a SysV
-            # semaphore, and Android kernels are built without CONFIG_SYSVIPC. Route installs to
-            # the direct downloader instead, which needs neither IPC nor root.
+            # Real apk works under a nested proot -0: it extracts full dependency trees correctly.
+            # apk-tools v3 does fail its final database write (it locks with a SysV semaphore, and
+            # Android has no SysV IPC) — but that happens AFTER every file is extracted, so it's
+            # cosmetic. Elevate write-y subcommands through sudo and swallow that one error.
             case "${'$'}1" in
-              add)
-                shift
-                exec /usr/local/bin/alpine-install "${'$'}@" ;;
-              del|remove)
-                shift
-                exec /usr/local/bin/alpine-uninstall "${'$'}@" ;;
-              info|list)
-                ls /var/cache/alpine-install/installed 2>/dev/null | sed 's/\.files${'$'}//'
+              add|del|fix|upgrade)
+                /usr/local/bin/sudo /sbin/apk --no-cache "${'$'}@" 2>&1 \
+                  | grep -v 'System state may be inconsistent'
                 exit 0 ;;
-              update)
-                rm -f /var/cache/alpine-install/APKINDEX.* ; echo "index cache cleared"; exit 0 ;;
               *)
                 exec /sbin/apk "${'$'}@" ;;
             esac
@@ -419,40 +447,66 @@ class Sandbox(private val ctx: Context) {
         termux.writeText(
             """
             #!/bin/sh
-            # Install Android/aarch64 packages from the Termux repo into this sandbox.
-            #   termux-install aapt2 d8 apksigner openjdk-17
+            # Install Android/aarch64 packages from the Termux repo, with FULL recursive dependency
+            # resolution. A Termux binary like aapt2 pulls in libfmt, libprotobuf, all of abseil,
+            # etc. — missing any one is "library not found". The index is parsed once into flat
+            # lookup files so the dependency closure is fast even for deep trees.
             set -e
             REPO=https://packages.termux.dev/apt/termux-main
-            IDX=/tmp/termux-packages-index
+            IDX=/tmp/termux-index
+            MAP=/tmp/termux-map
+            DEP=/tmp/termux-dep
             PREFIX=/data/data/com.termux/files/usr
 
             [ ${'$'}# -gt 0 ] || { echo "usage: termux-install <package>..."; exit 2; }
-            command -v dpkg  >/dev/null 2>&1 || apk add dpkg  >/dev/null
-            command -v wget  >/dev/null 2>&1 || apk add wget  >/dev/null
+            command -v dpkg >/dev/null 2>&1 || apk add dpkg >/dev/null 2>&1
+            command -v wget >/dev/null 2>&1 || apk add wget >/dev/null 2>&1
 
-            if [ ! -s "${'$'}IDX" ]; then
+            if [ ! -s "${'$'}MAP" ]; then
               echo "fetching package index..."
               wget -qO "${'$'}IDX" "${'$'}REPO/dists/stable/main/binary-aarch64/Packages"
+              awk '
+                /^Package: / {p=${'$'}2}
+                /^Filename: / {print p "\t" ${'$'}2 > "'"${'$'}MAP"'"}
+                /^Depends: / {d=${'$'}0; sub(/^Depends: /,"",d); gsub(/\([^)]*\)/,"",d); gsub(/,/," ",d);
+                              print p "\t" d > "'"${'$'}DEP"'"}
+              ' "${'$'}IDX"
             fi
 
+            RESOLVED=" "
+            ORDER=""
+            resolve() {   # depth-first: dependencies land before the package that needs them
+              p=${'$'}1
+              case "${'$'}RESOLVED" in *" ${'$'}p "*) return ;; esac
+              RESOLVED="${'$'}RESOLVED${'$'}p "
+              for d in ${'$'}(grep -m1 "^${'$'}p	" "${'$'}DEP" | cut -f2); do resolve "${'$'}d"; done
+              ORDER="${'$'}ORDER ${'$'}p"
+            }
+            for pkg in "${'$'}@"; do resolve "${'$'}pkg"; done
+
             mkdir -p "${'$'}PREFIX/bin" "${'$'}PREFIX/lib"
-            for pkg in "${'$'}@"; do
-              file=${'$'}(awk -v p="${'$'}pkg" '${'$'}1=="Package:"{c=${'$'}2} ${'$'}1=="Filename:"&&c==p{print ${'$'}2; exit}' "${'$'}IDX")
-              if [ -z "${'$'}file" ]; then echo "no such package: ${'$'}pkg"; exit 1; fi
-              deps=${'$'}(awk -v p="${'$'}pkg" '${'$'}1=="Package:"{c=${'$'}2} /^Depends:/&&c==p{sub(/^Depends: /,""); gsub(/\([^)]*\)/,""); gsub(/,/," "); print; exit}' "${'$'}IDX")
-              echo "==> ${'$'}pkg ${'$'}{deps:+(deps: ${'$'}deps)}"
-              wget -qO /tmp/termux-pkg.deb "${'$'}REPO/${'$'}file"
-              dpkg -x /tmp/termux-pkg.deb /
-              rm -f /tmp/termux-pkg.deb
-              for d in ${'$'}deps; do
-                case " ${'$'}INSTALLED " in *" ${'$'}d "*) continue ;; esac
-                dfile=${'$'}(awk -v p="${'$'}d" '${'$'}1=="Package:"{c=${'$'}2} ${'$'}1=="Filename:"&&c==p{print ${'$'}2; exit}' "${'$'}IDX")
-                [ -n "${'$'}dfile" ] || continue
-                wget -qO /tmp/termux-dep.deb "${'$'}REPO/${'$'}dfile" && dpkg -x /tmp/termux-dep.deb / && echo "    + ${'$'}d"
-                rm -f /tmp/termux-dep.deb
-                INSTALLED="${'$'}INSTALLED ${'$'}d"
-              done
+            echo "resolved ${'$'}(echo ${'$'}ORDER | wc -w) packages, installing..."
+            for p in ${'$'}ORDER; do
+              file=${'$'}(grep -m1 "^${'$'}p	" "${'$'}MAP" | cut -f2)
+              [ -n "${'$'}file" ] || continue    # virtual/provided names have no .deb
+              if wget -qO /tmp/t.deb "${'$'}REPO/${'$'}file" 2>/dev/null && dpkg -x /tmp/t.deb / 2>/dev/null; then
+                echo "  + ${'$'}p"
+              else
+                echo "  ! ${'$'}p (skipped)"
+              fi
+              rm -f /tmp/t.deb
             done
+            # Termux's wrapper scripts start with #!/data/data/com.termux/files/usr/bin/sh, a path
+            # that only exists inside Termux. Point the usual names at Alpine's equivalents so
+            # those scripts can actually run here.
+            mkdir -p "${'$'}PREFIX/bin" "${'$'}PREFIX/tmp"
+            for name in sh env bash dirname basename uname sed grep awk cut head tail; do
+              if [ ! -e "${'$'}PREFIX/bin/${'$'}name" ]; then
+                real=${'$'}(command -v "${'$'}name" 2>/dev/null)
+                [ -n "${'$'}real" ] && ln -sf "${'$'}real" "${'$'}PREFIX/bin/${'$'}name"
+              fi
+            done
+
             echo "installed under ${'$'}PREFIX (already on PATH)"
             """.trimIndent() + "\n"
         )
@@ -521,6 +575,103 @@ class Sandbox(private val ctx: Context) {
             """.trimIndent() + "\n"
         )
         sdk.setExecutable(true, false)
+
+        // APK reverse-engineering kit. All Android/aarch64 builds, so they run natively here.
+        val apktools = File(bin, "apk-tools-install")
+        apktools.writeText(
+            """
+            #!/bin/sh
+            # APK tooling, all running on Alpine's own musl JVM.
+            #
+            # Termux builds are Android binaries: their ELF interpreter is /system/bin/linker64,
+            # which is a symlink into /apex. Neither reliably survives into this rootfs, so those
+            # fail with "cannot execute: required file not found". apktool, jadx and dex2jar are
+            # pure Java, so they need no native Android anything — only a JVM that works.
+            set -e
+            LIB=/usr/local/lib
+            mkdir -p "${'$'}LIB"
+
+            if ! java -version >/dev/null 2>&1; then
+              echo "==> installing Alpine's JDK (musl-native HotSpot; real apk pulls the full dep tree)"
+              apk add openjdk17-jre-headless
+            fi
+
+            fetch() {  # url, destination
+              [ -f "${'$'}2" ] && { echo "  have ${'$'}(basename "${'$'}2")"; return 0; }
+              echo "  fetching ${'$'}(basename "${'$'}2")"
+              wget -q -O "${'$'}2" "${'$'}1" || { echo "  ! download failed"; rm -f "${'$'}2"; return 1; }
+            }
+
+            echo "==> apktool"
+            fetch "https://github.com/iBotPeaches/Apktool/releases/download/v3.0.3/apktool_3.0.3.jar" \
+                  "${'$'}LIB/apktool.jar" || true
+
+            echo "==> jadx"
+            if [ ! -x /usr/local/jadx/bin/jadx ]; then
+              command -v unzip >/dev/null 2>&1 || apk add unzip >/dev/null
+              if fetch "https://github.com/skylot/jadx/releases/download/v1.5.6/jadx-1.5.6.zip" /tmp/jadx.zip; then
+                mkdir -p /usr/local/jadx && unzip -qo /tmp/jadx.zip -d /usr/local/jadx && rm -f /tmp/jadx.zip
+                chmod +x /usr/local/jadx/bin/* 2>/dev/null || true
+              fi
+            else
+              echo "  have jadx"
+            fi
+
+            # Wrappers so the usual names work regardless of where the jars live.
+            cat > /usr/local/bin/apktool <<'EOF'
+            #!/bin/sh
+            exec java -jar /usr/local/lib/apktool.jar "$@"
+            EOF
+            cat > /usr/local/bin/jadx <<'EOF'
+            #!/bin/sh
+            exec /usr/local/jadx/bin/jadx "$@"
+            EOF
+            chmod 755 /usr/local/bin/apktool /usr/local/bin/jadx
+
+            echo
+            echo "==> JVM check"
+            java -version 2>&1 | head -3 || echo "  ! the JVM failed to start (see above)"
+            echo
+            echo "installed:"
+            for t in java apktool jadx baksmali smali; do
+              printf '  %-10s %s\n' "${'$'}t" "${'$'}(command -v ${'$'}t || echo MISSING)"
+            done
+            echo
+            echo "baksmali <apk> [out] and smali <dir> [out.apk] are apktool, which embeds both."
+            """.trimIndent() + "\n"
+        )
+        apktools.setExecutable(true, false)
+
+        // Familiar names for the two operations everyone reaches for. apktool embeds smali and
+        // baksmali, so these are shims onto it rather than separate binaries.
+        File(bin, "baksmali").apply {
+            writeText(
+                """
+                #!/bin/sh
+                # baksmali <file.apk|file.dex> [outdir]   — disassemble to smali via apktool
+                in="${'$'}1"; out="${'$'}{2:-${'$'}{1%.*}-smali}"
+                [ -n "${'$'}in" ] || { echo "usage: baksmali <apk|dex> [outdir]"; exit 2; }
+                command -v apktool >/dev/null 2>&1 || { echo "apktool missing - run apk-tools-install"; exit 1; }
+                echo "disassembling ${'$'}in -> ${'$'}out"
+                exec apktool d -f -o "${'$'}out" "${'$'}in"
+                """.trimIndent() + "\n"
+            )
+            setExecutable(true, false)
+        }
+        File(bin, "smali").apply {
+            writeText(
+                """
+                #!/bin/sh
+                # smali <dir> [out.apk]   — reassemble a disassembled tree via apktool
+                dir="${'$'}1"; out="${'$'}{2:-${'$'}{1%/}-rebuilt.apk}"
+                [ -n "${'$'}dir" ] || { echo "usage: smali <dir> [out.apk]"; exit 2; }
+                command -v apktool >/dev/null 2>&1 || { echo "apktool missing - run apk-tools-install"; exit 1; }
+                echo "assembling ${'$'}dir -> ${'$'}out"
+                exec apktool b -f -o "${'$'}out" "${'$'}dir"
+                """.trimIndent() + "\n"
+            )
+            setExecutable(true, false)
+        }
     }
 
     /** Copies an imported file into bin/ and makes it executable. */

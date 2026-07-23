@@ -855,6 +855,26 @@ private fun SetupTab(vm: Session) {
             color = Dim, fontSize = 11.sp, lineHeight = 16.sp
         )
 
+        Button(
+            onClick = { vm.installApkTools() },
+            modifier = Modifier.fillMaxWidth(),
+            enabled = !vm.apkToolsInstalling,
+            shape = RoundedCornerShape(4.dp),
+            colors = ButtonDefaults.buttonColors(containerColor = Panel, contentColor = Orange)
+        ) {
+            Text(
+                if (vm.apkToolsInstalling) "downloading… watch the log below"
+                else "install apk tools (apktool, jadx, dex2jar)",
+                fontFamily = mono, fontSize = 12.sp
+            )
+        }
+        Text(
+            "Takes APKs apart: apktool for smali and resources, jadx for Java source, dex2jar, " +
+                "plus aapt2/apksigner and a JDK. baksmali and smali are provided by apktool, " +
+                "which is built on them. Around 200 MB, downloaded rather than bundled.",
+            color = Dim, fontSize = 11.sp, lineHeight = 16.sp
+        )
+
         Text("permissions", color = Dim, fontFamily = mono, fontSize = 11.sp)
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             listOf(
