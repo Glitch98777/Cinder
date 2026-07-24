@@ -855,6 +855,16 @@ class Session(app: Application) : AndroidViewModel(app) {
 
     private var notifyId = 7000
 
+    // The agent sometimes fires the same install/notify request repeatedly (retry loops), which
+    // spammed prompts and notifications. Remember the last request of each kind and ignore an
+    // identical one that arrives within the cooldown, so each distinct request acts exactly once.
+    private var lastInstallReq: Pair<String, Long>? = null
+    private var lastNotifyReq: Pair<String, Long>? = null
+    private val requestCooldownMs = 60_000L
+
+    private fun isDuplicate(last: Pair<String, Long>?, key: String, now: Long) =
+        last != null && last.first == key && now - last.second < requestCooldownMs
+
     /**
      * Arms a phone notification for [seconds] from now with the agent's [title]/[body]. Uses
      * AlarmManager so it fires even if the app is backgrounded or the screen is off; the alarm
@@ -899,7 +909,9 @@ class Session(app: Application) : AndroidViewModel(app) {
                     if (!getpropSnap.exists()) sandbox.refreshSystemInfo()
                     if (installReq.exists()) {
                         val guest = installReq.readText().trim(); installReq.delete()
-                        if (guest.isNotBlank()) {
+                        val now = System.currentTimeMillis()
+                        if (guest.isNotBlank() && !isDuplicate(lastInstallReq, guest, now)) {
+                            lastInstallReq = guest to now
                             val apk = guestToHost(guest)
                             withContext(Dispatchers.Main) {
                                 if (apk != null) installApk(apk)
@@ -918,11 +930,15 @@ class Session(app: Application) : AndroidViewModel(app) {
                         }
                     }
                     if (notifyReq.exists()) {
-                        val lines = notifyReq.readText().split("\n"); notifyReq.delete()
+                        val raw = notifyReq.readText(); notifyReq.delete()
+                        val lines = raw.split("\n")
                         val sec = lines.getOrNull(0)?.trim()?.toLongOrNull()
                         val title = lines.getOrNull(1)?.trim().orEmpty()
                         val body = lines.drop(2).joinToString("\n").trim()
-                        if (sec != null && title.isNotEmpty()) {
+                        val now = System.currentTimeMillis()
+                        val key = "$sec|$title|$body"
+                        if (sec != null && title.isNotEmpty() && !isDuplicate(lastNotifyReq, key, now)) {
+                            lastNotifyReq = key to now
                             withContext(Dispatchers.Main) { scheduleNotification(sec, title, body) }
                         }
                     }

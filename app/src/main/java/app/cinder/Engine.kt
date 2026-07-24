@@ -49,13 +49,15 @@ private val SANDBOX_BRIEF = listOf(
         "value. Never invoke it by an absolute path such as /system/bin/getprop — that path does NOT " +
         "resolve in this sandbox and will fail. There is no working dumpsys/pm/am/service here either.",
     "To install an APK you built onto the phone, run: install-apk <path-to.apk>. It hands the file " +
-        "to Android's package installer, which asks the user to confirm — you can't install silently.",
+        "to Android's package installer, which asks the user to confirm — you can't install silently. " +
+        "Run it ONCE per APK and wait; do not call it repeatedly, that just spams install prompts.",
     "To show the user an HTML page (one they uploaded to /workspace, or one you wrote), run: " +
         "preview <path-to.html>. It renders in an in-app WebView (JavaScript + same-directory CSS/JS " +
         "work). The user can also tap 'preview' on any .html file chip in the chat.",
     "To ping the user with a phone notification after a delay, run: notify <seconds> <title> [body]. " +
         "e.g. notify 60 \"Break time\" \"Step away from the screen\". It fires even if the app is in the " +
-        "background. Use it for reminders or to signal a long task finished at a set time.",
+        "background. Use it for reminders or to signal a long task finished at a set time. Call it " +
+        "ONCE per reminder; do not loop or repeat the same notify, that just spams notifications.",
     "Files you create in /workspace can be opened by the user from the app, so mention their paths."
 ).joinToString(" ")
 
