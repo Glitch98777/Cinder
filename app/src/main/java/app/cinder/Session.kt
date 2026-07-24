@@ -303,13 +303,33 @@ class Session(app: Application) : AndroidViewModel(app) {
                 installTools().join()
                 // stop button may have cancelled us while the toolchain was installing
                 kotlin.coroutines.coroutineContext.ensureActive()
-                if (!engine.running) engine.start(::onEvent)
+                if (!engine.running) startOrResumeEngine()
                 engine.send(text)
             }
             return
         }
-        if (!engine.running) engine.start(::onEvent)
+        if (!engine.running) startOrResumeEngine()
         engine.send(text)
+    }
+
+    /**
+     * (Re)starts the CLI, resuming the current conversation when there is one. The engine is a
+     * long-lived process that holds the whole conversation in memory, but on a phone it can be
+     * reaped between messages — Android's low-memory killer takes the proot/claude child, or
+     * backgrounding the app kills it. Starting fresh then would silently drop all context (the
+     * "randomly forgets mid-chat" bug). Resuming [currentId] makes the CLI reload the conversation
+     * from its on-disk session store, so context survives a process death. A brand-new chat has
+     * currentId == null and correctly starts clean.
+     */
+    private fun startOrResumeEngine() {
+        // Always resume the LATEST session id, not a stale one: --resume can mint a new session id
+        // each time, which arrives on the next Init and updates currentId. newSession() nulls both,
+        // so a genuinely fresh chat starts clean.
+        currentId?.let {
+            android.util.Log.i("claudecode", "engine (re)start mid-session; resuming $it")
+            engine.resumeId = it
+        }
+        engine.start(::onEvent)
     }
 
     // ---------------- session history ----------------
