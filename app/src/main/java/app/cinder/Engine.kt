@@ -44,14 +44,18 @@ private val SANDBOX_BRIEF = listOf(
         "interpreter and rpath to use them. If an Android binary ever reports 'not found' for its loader " +
         "or a library, just run: android-bootstrap — it re-copies and re-patches everything.",
     "Those land in /data/data/com.termux/files/usr and are already on PATH. Cross-compilers: termux-install clang binutils make cmake.",
-    "Android's own tools are on PATH too and run reliably via linker shims: getprop (read system " +
-        "properties), dumpsys, service, settings, cmd, wm, input, screencap, pm, am. Use `getprop` " +
-        "to list device/system info, `getprop <name>` for one property.",
+    "To read device/system properties, run getprop by that bare name only (it is a wrapper on PATH " +
+        "that returns instantly): getprop lists everything, getprop ro.product.model returns one " +
+        "value. Never invoke it by an absolute path such as /system/bin/getprop — that path does NOT " +
+        "resolve in this sandbox and will fail. There is no working dumpsys/pm/am/service here either.",
     "To install an APK you built onto the phone, run: install-apk <path-to.apk>. It hands the file " +
         "to Android's package installer, which asks the user to confirm — you can't install silently.",
     "To show the user an HTML page (one they uploaded to /workspace, or one you wrote), run: " +
         "preview <path-to.html>. It renders in an in-app WebView (JavaScript + same-directory CSS/JS " +
         "work). The user can also tap 'preview' on any .html file chip in the chat.",
+    "To ping the user with a phone notification after a delay, run: notify <seconds> <title> [body]. " +
+        "e.g. notify 60 \"Break time\" \"Step away from the screen\". It fires even if the app is in the " +
+        "background. Use it for reminders or to signal a long task finished at a set time.",
     "Files you create in /workspace can be opened by the user from the app, so mention their paths."
 ).joinToString(" ")
 

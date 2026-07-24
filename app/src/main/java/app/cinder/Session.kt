@@ -131,19 +131,7 @@ class Session(app: Application) : AndroidViewModel(app) {
             val out = StringBuilder()
             runCatching {
                 val p = sandbox.spawn("""
-                    P=/data/data/com.termux/files/usr; A=/usr/local/androidlib64
-                    echo "bins: ${'$'}(ls ${'$'}P/bin 2>/dev/null | tr '\n' ' ')"
-                    echo "selinux.so: ${'$'}(ls ${'$'}P/lib/libandroid-selinux.so 2>&1 | tail -1)"
-                    command -v patchelf >/dev/null 2>&1 || { echo "no patchelf"; exit 0; }
-                    for f in ${'$'}(find ${'$'}P/bin -type f 2>/dev/null); do
-                      head -c4 "${'$'}f" 2>/dev/null | grep -qa ELF || continue
-                      m=""
-                      for n in ${'$'}(patchelf --print-needed "${'$'}f" 2>/dev/null); do
-                        [ -e "${'$'}A/${'$'}n" ] || [ -e "${'$'}P/lib/${'$'}n" ] || m="${'$'}m ${'$'}n"
-                      done
-                      [ -n "${'$'}m" ] && echo "MISSING ${'$'}(basename ${'$'}f):${'$'}m"
-                    done
-                    echo "interp of first bin: ${'$'}(f=${'$'}(find ${'$'}P/bin -type f | head -1); patchelf --print-interpreter ${'$'}f 2>&1)"
+                    echo "getprop model: ${'$'}(getprop ro.product.model 2>&1 | tail -1)"
                 """.trimIndent() + " 2>&1")
                 java.io.BufferedReader(java.io.InputStreamReader(p.inputStream))
                     .forEachLine { out.appendLine(it.trim()) }
@@ -297,6 +285,7 @@ class Session(app: Application) : AndroidViewModel(app) {
             return
         }
         busy = true
+        awaitingFreshTurn = false   // startOrResumeEngine sets this true only when it resumes
         status = "thinking"
         // The CLI insists on a POSIX shell, and Alpine's minirootfs has only busybox ash. Pull
         // bash in on the first message rather than making it a setup chore.
@@ -331,8 +320,9 @@ class Session(app: Application) : AndroidViewModel(app) {
         // each time, which arrives on the next Init and updates currentId. newSession() nulls both,
         // so a genuinely fresh chat starts clean.
         currentId?.let {
-            android.util.Log.i("claudecode", "engine (re)start mid-session; resuming $it")
+            android.util.Log.i("ccbusy", "engine (re)start mid-session; resuming $it")
             engine.resumeId = it
+            awaitingFreshTurn = true   // a stale replayed Done may precede the real answer
         }
         engine.start(::onEvent)
     }
@@ -448,6 +438,16 @@ class Session(app: Application) : AndroidViewModel(app) {
 
     private var pendingSend: kotlinx.coroutines.Job? = null
 
+    /**
+     * Set when the engine is resumed mid-conversation. A freshly --resume'd CLI can emit a result
+     * frame for the reloaded session before it processes the new message; that stale Done would
+     * clear [busy] and drop the stop button for the turn that's actually running (the "second
+     * message after waking has no stop button" bug). We ignore one such Done that arrives before any
+     * real output. Harmless when no stale frame comes: real output clears the flag first, so the
+     * turn's genuine Done still ends it.
+     */
+    private var awaitingFreshTurn = false
+
     fun interrupt() {
         if (loginActive) { cancelLogin(); transcript.add(Turn.Notice("login cancelled")); return }
         pendingSend?.cancel()          // a first message still waiting on the toolchain install
@@ -514,12 +514,22 @@ class Session(app: Application) : AndroidViewModel(app) {
                 cwd = event.cwd ?: cwd
                 status = event.model ?: "ready"
                 event.sessionId?.takeIf { it.isNotBlank() }?.let { currentId = it }
+                android.util.Log.i("ccbusy", "Init session=${event.sessionId} busy=$busy awaitingFresh=$awaitingFreshTurn")
                 transcript.add(Turn.Notice("session started · ${event.tools.size} tools"))
             }
 
-            is Event.Message -> transcript.add(Turn.Assistant(event.text))
+            is Event.Message -> {
+                // Any streaming output means a turn is in flight, so the stop button must be up —
+                // no matter how the turn began (a resumed/woken session can produce a response the
+                // send() path never marked busy). Done flips it back off at the end.
+                if (!busy) busy = true
+                awaitingFreshTurn = false   // real output for this turn has begun
+                transcript.add(Turn.Assistant(event.text))
+            }
 
             is Event.Thinking -> {
+                if (!busy) busy = true
+                awaitingFreshTurn = false
                 status = "thinking"
                 // Consecutive thinking blocks are one stretch of reasoning, not several.
                 val last = transcript.lastOrNull()
@@ -532,6 +542,8 @@ class Session(app: Application) : AndroidViewModel(app) {
             }
 
             is Event.ToolCall -> {
+                if (!busy) busy = true
+                awaitingFreshTurn = false
                 // The tool call already carries the content being written, so the target line
                 // count is known before the file exists — no need to wait for the disk.
                 val target = when (event.name) {
@@ -575,6 +587,14 @@ class Session(app: Application) : AndroidViewModel(app) {
             }
 
             is Event.Done -> {
+                android.util.Log.i("ccbusy", "Done subtype=${event.subtype} busy=$busy awaitingFresh=$awaitingFreshTurn")
+                if (awaitingFreshTurn) {
+                    // A result before any real output on a just-resumed engine is the reloaded
+                    // session's stale frame, not our answer. Ignore it once so the stop button
+                    // stays up for the turn actually in flight.
+                    awaitingFreshTurn = false
+                    return@launch
+                }
                 busy = false
                 status = "idle"
                 saveCurrent()   // a completed turn is worth keeping
@@ -833,6 +853,30 @@ class Session(app: Application) : AndroidViewModel(app) {
         previewFile = file
     }
 
+    private var notifyId = 7000
+
+    /**
+     * Arms a phone notification for [seconds] from now with the agent's [title]/[body]. Uses
+     * AlarmManager so it fires even if the app is backgrounded or the screen is off; the alarm
+     * hits [NotifyReceiver], which posts the notification.
+     */
+    fun scheduleNotification(seconds: Long, title: String, body: String) {
+        val ctx = getApplication<Application>()
+        val id = notifyId++
+        val intent = android.content.Intent(ctx, NotifyReceiver::class.java).apply {
+            putExtra("title", title); putExtra("body", body); putExtra("id", id)
+        }
+        val pi = android.app.PendingIntent.getBroadcast(
+            ctx, id, intent,
+            android.app.PendingIntent.FLAG_UPDATE_CURRENT or android.app.PendingIntent.FLAG_IMMUTABLE
+        )
+        val at = System.currentTimeMillis() + seconds * 1000
+        val am = ctx.getSystemService(android.content.Context.ALARM_SERVICE) as android.app.AlarmManager
+        runCatching { am.setExactAndAllowWhileIdle(android.app.AlarmManager.RTC_WAKEUP, at, pi) }
+            .onFailure { am.set(android.app.AlarmManager.RTC_WAKEUP, at, pi) }
+        transcript.add(Turn.Notice("🔔 notification scheduled in ${seconds}s: $title"))
+    }
+
     fun closePreview() {
         previewFile = null
     }
@@ -845,9 +889,14 @@ class Session(app: Application) : AndroidViewModel(app) {
     private fun watchInstallRequests() {
         val installReq = File(sandbox.home, ".cinder/install-request")
         val previewReq = File(sandbox.home, ".cinder/preview-request")
+        val notifyReq = File(sandbox.home, ".cinder/notify-request")
+        val getpropSnap = File(sandbox.home, ".cinder/getprop.txt")
         viewModelScope.launch(Dispatchers.IO) {
             while (true) {
                 runCatching {
+                    // The getprop shim deletes the snapshot after reading it; rewrite it so the
+                    // next call has fresh data. Cheap (only runs when it's actually missing).
+                    if (!getpropSnap.exists()) sandbox.refreshSystemInfo()
                     if (installReq.exists()) {
                         val guest = installReq.readText().trim(); installReq.delete()
                         if (guest.isNotBlank()) {
@@ -866,6 +915,15 @@ class Session(app: Application) : AndroidViewModel(app) {
                                 if (html != null) { previewHtml(html); transcript.add(Turn.Notice("previewing ${html.name}")) }
                                 else transcript.add(Turn.Notice("preview: file not found: $guest", isError = true))
                             }
+                        }
+                    }
+                    if (notifyReq.exists()) {
+                        val lines = notifyReq.readText().split("\n"); notifyReq.delete()
+                        val sec = lines.getOrNull(0)?.trim()?.toLongOrNull()
+                        val title = lines.getOrNull(1)?.trim().orEmpty()
+                        val body = lines.drop(2).joinToString("\n").trim()
+                        if (sec != null && title.isNotEmpty()) {
+                            withContext(Dispatchers.Main) { scheduleNotification(sec, title, body) }
                         }
                     }
                 }
@@ -1469,5 +1527,40 @@ class Session(app: Application) : AndroidViewModel(app) {
             if (n > 0) left -= n
             return n
         }
+    }
+}
+
+/**
+ * Posts the notification the agent scheduled via `notify`. Fired by AlarmManager, so it runs even
+ * when the app is backgrounded. Tapping the notification reopens the app.
+ */
+class NotifyReceiver : android.content.BroadcastReceiver() {
+    override fun onReceive(ctx: android.content.Context, intent: android.content.Intent) {
+        val title = intent.getStringExtra("title") ?: "Cinder"
+        val body = intent.getStringExtra("body").orEmpty()
+        val id = intent.getIntExtra("id", 1)
+        val nm = ctx.getSystemService(android.content.Context.NOTIFICATION_SERVICE) as android.app.NotificationManager
+        val channel = "cinder-agent"
+        runCatching {
+            nm.createNotificationChannel(
+                android.app.NotificationChannel(
+                    channel, "Agent pings", android.app.NotificationManager.IMPORTANCE_HIGH
+                )
+            )
+        }
+        val open = android.app.PendingIntent.getActivity(
+            ctx, 0, android.content.Intent(ctx, MainActivity::class.java)
+                .addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK),
+            android.app.PendingIntent.FLAG_IMMUTABLE
+        )
+        val n = android.app.Notification.Builder(ctx, channel)
+            .setContentTitle(title)
+            .setContentText(body)
+            .setStyle(android.app.Notification.BigTextStyle().bigText(body))
+            .setSmallIcon(R.mipmap.ic_launcher)
+            .setAutoCancel(true)
+            .setContentIntent(open)
+            .build()
+        runCatching { nm.notify(id, n) }
     }
 }

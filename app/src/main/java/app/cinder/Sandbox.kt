@@ -221,6 +221,25 @@ class Sandbox(private val ctx: Context) {
     }
 
     /**
+     * Snapshots the device's system properties for the sandbox. The agent's `getprop` can't run
+     * /system/bin/getprop through proot (this app's SELinux domain may exec it but not open it for
+     * reading), but the app PROCESS can Runtime.exec it directly — the standard way apps read ro.*
+     * props. Write the full output where the getprop shim reads it. Refreshed each launch so ro.*
+     * and current values stay reasonably fresh.
+     */
+    fun refreshSystemInfo() {
+        runCatching {
+            val p = ProcessBuilder("getprop").redirectErrorStream(true).start()
+            val text = p.inputStream.bufferedReader().readText()
+            p.waitFor()
+            if (text.isNotBlank()) {
+                File(home, ".cinder").apply { mkdirs() }
+                File(home, ".cinder/getprop.txt").writeText(text)
+            }
+        }
+    }
+
+    /**
      * Alpine's minirootfs enables only the **main** repo, but a lot of what the agent reaches for —
      * patchelf (needed by android-bootstrap), build tools, editors — lives in **community**. Write
      * both in, pinned to the rootfs's own Alpine version, so `apk add` can find them. Refreshed each
@@ -266,6 +285,7 @@ class Sandbox(private val ctx: Context) {
         ensureMountPoints()
         configureNetwork()
         configureRepositories()
+        refreshSystemInfo()   // snapshot getprop for the sandbox's getprop shim
         // Stage the bionic linker + flat libs in from the app side (proot can't reach /apex here).
         // Idempotent and cheap once done; must happen before any Android binary is exec'd.
         stageAndroidRuntime()
@@ -427,34 +447,31 @@ class Sandbox(private val ctx: Context) {
         )
         prootShim.setExecutable(true, false)
 
-        // Android's own system binaries (getprop, dumpsys, service, settings, …) live in /system/bin
-        // and are bionic, so under this SELinux domain their interpreter /system/bin/linker64 can
-        // dead-end just like proot did. Run them through the staged linker explicitly, with the flat
-        // bionic libs (which include the copied /system/lib64 set) on the library path. These shims
-        // sit first on PATH, so `getprop`, `dumpsys`, etc. Just Work for the agent.
-        for (tool in listOf(
-            "getprop", "setprop", "dumpsys", "service", "settings", "cmd", "getevent",
-            "wm", "input", "svc", "content", "am", "pm", "ime", "screencap"
-        )) {
-            val shim = File(shims, tool)
-            shim.writeText(
-                """
-                #!/bin/sh
-                # Run Android's bionic /system/bin/$tool via the staged linker so its interpreter
-                # resolves regardless of whether proot can sanitize /apex in this app's domain.
-                LNK=/usr/local/androidlibexec/linker64
-                REAL=/system/bin/$tool
-                [ -x "${'$'}REAL" ] || REAL=/system/xbin/$tool
-                if [ -x "${'$'}LNK" ] && [ -e "${'$'}REAL" ]; then
-                  exec env LD_LIBRARY_PATH=/usr/local/androidlib64:/system/lib64 \
-                    "${'$'}LNK" "${'$'}REAL" "${'$'}@"
-                else
-                  exec "${'$'}REAL" "${'$'}@"
-                fi
-                """.trimIndent() + "\n"
-            )
-            shim.setExecutable(true, false)
-        }
+        // getprop, out of the box. Android's /system/bin tools are labelled so that this app's
+        // SELinux domain may EXEC them but not open them for reading — which is exactly what a
+        // linker shim inside proot needs, so that approach fails ("unable to open file"). The app
+        // PROCESS, however, can Runtime.exec getprop fine, so the app snapshots its output to
+        // /root/.cinder/getprop.txt (see Sandbox.refreshSystemInfo, run each engine launch). This
+        // shim just reads that snapshot — instant, and it works without any /system access here.
+        val getpropShim = File(shims, "getprop")
+        getpropShim.writeText(
+            """
+            #!/bin/sh
+            SNAP=/root/.cinder/getprop.txt
+            [ -f "${'$'}SNAP" ] || { echo "(getprop snapshot not ready yet)"; exit 0; }
+            # Read the snapshot into memory, then delete it so it doesn't sit in storage. The app's
+            # watcher rewrites it within a second or so, so the next getprop call still works.
+            DATA=${'$'}(cat "${'$'}SNAP")
+            rm -f "${'$'}SNAP"
+            # getprop with no name (or a flag) lists everything; getprop <name> prints one value.
+            if [ -z "${'$'}1" ] || [ "${'$'}{1#-}" != "${'$'}1" ]; then
+              printf '%s\n' "${'$'}DATA"
+            else
+              printf '%s\n' "${'$'}DATA" | sed -n "s/^\[${'$'}1\]: \[\(.*\)\]${'$'}/\1/p"
+            fi
+            """.trimIndent() + "\n"
+        )
+        getpropShim.setExecutable(true, false)
 
         // install-apk <file.apk> — hand an APK the agent built to the phone's package installer.
         // The sandbox can't install packages itself (that needs a system permission), so it drops
@@ -492,6 +509,25 @@ class Sandbox(private val ctx: Context) {
             """.trimIndent() + "\n"
         )
         preview.setExecutable(true, false)
+
+        // notify <seconds> <title> [body...] — schedule a phone notification to ping the user after
+        // a delay. The sandbox can't post Android notifications, so it drops a request the app is
+        // watching; the app arms an alarm (which fires even if it's backgrounded) with the title
+        // and body. Request format: three lines — seconds, title, body (body may be empty).
+        val notify = File(bin, "notify")
+        notify.writeText(
+            """
+            #!/bin/sh
+            sec="${'$'}1"; title="${'$'}2"
+            [ -n "${'$'}sec" ] && [ -n "${'$'}title" ] || { echo "usage: notify <seconds> <title> [body...]"; exit 2; }
+            case "${'$'}sec" in ''|*[!0-9]*) echo "seconds must be a whole number"; exit 2 ;; esac
+            shift 2; body="${'$'}*"
+            mkdir -p /root/.cinder
+            { printf '%s\n' "${'$'}sec"; printf '%s\n' "${'$'}title"; printf '%s\n' "${'$'}body"; } > /root/.cinder/notify-request
+            echo "scheduled notification in ${'$'}{sec}s: ${'$'}title"
+            """.trimIndent() + "\n"
+        )
+        notify.setExecutable(true, false)
 
         // `apk add` is the muscle memory for Alpine, and the agent will reach for it before it
         // reaches for sudo. /usr/local/bin comes first on PATH, so this shim shadows /sbin/apk

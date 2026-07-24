@@ -6,6 +6,8 @@
     <!-- Lets the agent install an APK it built: the app hands the file to the system package
          installer, which still asks the user to confirm. -->
     <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+    <!-- Lets the agent schedule a notification to ping the user after a delay. -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
     <application
         android:allowBackup="false"
@@ -24,5 +26,10 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <!-- Fires the agent's scheduled notification when its alarm goes off. -->
+        <receiver
+            android:name=".NotifyReceiver"
+            android:exported="false" />
     </application>
 </manifest>
