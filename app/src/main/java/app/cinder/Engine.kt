@@ -44,7 +44,14 @@ private val SANDBOX_BRIEF = listOf(
         "interpreter and rpath to use them. If an Android binary ever reports 'not found' for its loader " +
         "or a library, just run: android-bootstrap — it re-copies and re-patches everything.",
     "Those land in /data/data/com.termux/files/usr and are already on PATH. Cross-compilers: termux-install clang binutils make cmake.",
-    "Android's own tools are on PATH too (getprop, pm, am, dumpsys) since /system is mounted.",
+    "Android's own tools are on PATH too and run reliably via linker shims: getprop (read system " +
+        "properties), dumpsys, service, settings, cmd, wm, input, screencap, pm, am. Use `getprop` " +
+        "to list device/system info, `getprop <name>` for one property.",
+    "To install an APK you built onto the phone, run: install-apk <path-to.apk>. It hands the file " +
+        "to Android's package installer, which asks the user to confirm — you can't install silently.",
+    "To show the user an HTML page (one they uploaded to /workspace, or one you wrote), run: " +
+        "preview <path-to.html>. It renders in an in-app WebView (JavaScript + same-directory CSS/JS " +
+        "work). The user can also tap 'preview' on any .html file chip in the chat.",
     "Files you create in /workspace can be opened by the user from the app, so mention their paths."
 ).joinToString(" ")
 
@@ -108,7 +115,14 @@ class Engine(private val sandbox: Sandbox, private val scope: CoroutineScope) {
             // Without this the model assumes a normal Linux box and reaches for apt/brew/sudo-less
             // apk, all of which fail here.
             append("--append-system-prompt ")
-            append('"').append(SANDBOX_BRIEF).append("\" ")
+            // The brief is embedded inside a double-quoted shell argument, so any backtick or $ in
+            // it would be command-substituted by /bin/sh and wreck the launch ("unexpected end of
+            // file"). Escape the four chars that stay special inside double quotes so the brief text
+            // is passed through literally no matter what it contains.
+            val safeBrief = SANDBOX_BRIEF
+                .replace("\\", "\\\\").replace("\"", "\\\"")
+                .replace("$", "\\$").replace("`", "\\`")
+            append('"').append(safeBrief).append("\" ")
             append("--verbose")
         }
         val cmd = sandbox.prootCommand(inner)

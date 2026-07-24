@@ -77,6 +77,10 @@ class Session(app: Application) : AndroidViewModel(app) {
     var cwd by mutableStateOf("")
         private set
 
+    /** When non-null, the UI shows a full-screen WebView rendering this HTML file from the workspace. */
+    var previewFile by mutableStateOf<File?>(null)
+        private set
+
     /** Declared before init{} on purpose — loadHistory() writes to it during construction. */
     var history by mutableStateOf(listOf<SessionRecord>())
         private set
@@ -100,6 +104,7 @@ class Session(app: Application) : AndroidViewModel(app) {
             log("android runtime: linker=${if (linker) "ok" else "MISSING"}, $libs bionic libs staged")
         }.onFailure { android.util.Log.e("claudecode", "stageAndroidRuntime failed", it) }
         cwd = sandbox.workspace.absolutePath
+        watchInstallRequests()   // let the agent's `install-apk` open the OS installer
         refreshInstalls()
         loadHistory()
         bootstrap(force = false)
@@ -757,6 +762,114 @@ class Session(app: Application) : AndroidViewModel(app) {
                     { onDone("saved Downloads/${file.name}", it) },
                     { onDone("export failed: ${it.message}", null) }
                 )
+            }
+        }
+    }
+
+    /** Maps a guest (rootfs) path the agent used back to the real file on the Android side. */
+    private fun guestToHost(guest: String): File? {
+        val g = guest.trim().trim('`', '"', '\'')
+        val f = when {
+            g.startsWith("/workspace/") -> File(sandbox.workspace, g.removePrefix("/workspace/"))
+            g.startsWith("/root/") -> File(sandbox.home, g.removePrefix("/root/"))
+            g.startsWith("/tmp/") -> File(sandbox.tmp, g.removePrefix("/tmp/"))
+            g.startsWith("/") -> File(sandbox.rootfs, g.removePrefix("/"))  // anywhere else in the rootfs
+            else -> File(sandbox.workspace, g)
+        }
+        return f.takeIf { it.isFile }
+    }
+
+    /**
+     * Hands an APK to the phone's package installer. The sandbox can't install packages itself (a
+     * system permission), so it stages the file into Downloads for a shareable content:// uri and
+     * fires ACTION_VIEW — the OS installer then opens and asks the user to confirm.
+     */
+    fun installApk(file: File) {
+        viewModelScope.launch(Dispatchers.IO) {
+            val ctx = getApplication<Application>()
+            val staged = runCatching {
+                val resolver = ctx.contentResolver
+                val values = android.content.ContentValues().apply {
+                    put(android.provider.MediaStore.Downloads.DISPLAY_NAME, file.name)
+                    put(
+                        android.provider.MediaStore.Downloads.MIME_TYPE,
+                        "application/vnd.android.package-archive"
+                    )
+                    put(
+                        android.provider.MediaStore.Downloads.RELATIVE_PATH,
+                        android.os.Environment.DIRECTORY_DOWNLOADS
+                    )
+                }
+                val uri = resolver.insert(
+                    android.provider.MediaStore.Downloads.EXTERNAL_CONTENT_URI, values
+                ) ?: error("cannot stage apk")
+                resolver.openOutputStream(uri)!!.use { out -> file.inputStream().use { it.copyTo(out) } }
+                uri
+            }
+            withContext(Dispatchers.Main) {
+                staged.fold({ uri ->
+                    runCatching {
+                        val intent = android.content.Intent(android.content.Intent.ACTION_VIEW).apply {
+                            setDataAndType(uri, "application/vnd.android.package-archive")
+                            addFlags(
+                                android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION or
+                                    android.content.Intent.FLAG_ACTIVITY_NEW_TASK
+                            )
+                        }
+                        ctx.startActivity(intent)
+                        transcript.add(Turn.Notice("installing ${file.name} — confirm the prompt"))
+                    }.onFailure {
+                        transcript.add(Turn.Notice("install failed to launch: ${it.message}", isError = true))
+                    }
+                }, {
+                    transcript.add(Turn.Notice("install failed: ${it.message}", isError = true))
+                })
+            }
+        }
+    }
+
+    /** Opens the HTML file in the in-app WebView preview. */
+    fun previewHtml(file: File) {
+        previewFile = file
+    }
+
+    fun closePreview() {
+        previewFile = null
+    }
+
+    /**
+     * Watches for requests dropped by the `install-apk` and `preview` sandbox helpers. The agent
+     * can't launch an Android intent or open a WebView itself, so it writes the target's guest path
+     * to a file this polls; when it appears we map it to real storage and act on it.
+     */
+    private fun watchInstallRequests() {
+        val installReq = File(sandbox.home, ".cinder/install-request")
+        val previewReq = File(sandbox.home, ".cinder/preview-request")
+        viewModelScope.launch(Dispatchers.IO) {
+            while (true) {
+                runCatching {
+                    if (installReq.exists()) {
+                        val guest = installReq.readText().trim(); installReq.delete()
+                        if (guest.isNotBlank()) {
+                            val apk = guestToHost(guest)
+                            withContext(Dispatchers.Main) {
+                                if (apk != null) installApk(apk)
+                                else transcript.add(Turn.Notice("install: file not found: $guest", isError = true))
+                            }
+                        }
+                    }
+                    if (previewReq.exists()) {
+                        val guest = previewReq.readText().trim(); previewReq.delete()
+                        if (guest.isNotBlank()) {
+                            val html = guestToHost(guest)
+                            withContext(Dispatchers.Main) {
+                                if (html != null) { previewHtml(html); transcript.add(Turn.Notice("previewing ${html.name}")) }
+                                else transcript.add(Turn.Notice("preview: file not found: $guest", isError = true))
+                            }
+                        }
+                    }
+                }
+                kotlinx.coroutines.delay(1200)
             }
         }
     }

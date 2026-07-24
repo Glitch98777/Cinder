@@ -98,6 +98,8 @@ private fun Root(vm: Session) {
                         Tab.Terminal -> TerminalTab(vm)
                         Tab.Setup -> SetupTab(vm)
                     }
+                    // HTML preview rides above the current tab so it can be opened from anywhere.
+                    vm.previewFile?.let { HtmlPreview(it) { vm.closePreview() } }
                 }
             }
         }
@@ -509,30 +511,85 @@ private fun FileChips(text: String) {
 
     Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
         files.forEach { f ->
-            OutlinedButton(
-                onClick = {
-                    vm.exportFile(f) { msg, uri ->
-                        note = msg
-                        if (uri != null) runCatching {
-                            ctx.startActivity(
-                                android.content.Intent(android.content.Intent.ACTION_VIEW)
-                                    .setDataAndType(uri, ctx.contentResolver.getType(uri))
-                                    .addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                            )
+            val isHtml = f.extension.lowercase() in listOf("html", "htm")
+            val isApk = f.extension.lowercase() == "apk"
+            Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                OutlinedButton(
+                    onClick = {
+                        vm.exportFile(f) { msg, uri ->
+                            note = msg
+                            if (uri != null) runCatching {
+                                ctx.startActivity(
+                                    android.content.Intent(android.content.Intent.ACTION_VIEW)
+                                        .setDataAndType(uri, ctx.contentResolver.getType(uri))
+                                        .addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                                )
+                            }
                         }
-                    }
-                },
-                shape = RoundedCornerShape(4.dp),
-                contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp),
-                colors = ButtonDefaults.outlinedButtonColors(containerColor = Panel, contentColor = Blue)
-            ) {
-                Text(
-                    "⤓  ${f.name}  ${f.length() / 1024 + 1} KB",
-                    fontFamily = mono, fontSize = 11.sp, maxLines = 1
-                )
+                    },
+                    shape = RoundedCornerShape(4.dp),
+                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp),
+                    colors = ButtonDefaults.outlinedButtonColors(containerColor = Panel, contentColor = Blue)
+                ) {
+                    Text(
+                        "⤓  ${f.name}  ${f.length() / 1024 + 1} KB",
+                        fontFamily = mono, fontSize = 11.sp, maxLines = 1
+                    )
+                }
+                if (isHtml) OutlinedButton(
+                    onClick = { vm.previewHtml(f) },
+                    shape = RoundedCornerShape(4.dp),
+                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp),
+                    colors = ButtonDefaults.outlinedButtonColors(containerColor = Panel, contentColor = Orange)
+                ) { Text("▶ preview", fontFamily = mono, fontSize = 11.sp, maxLines = 1) }
+                if (isApk) OutlinedButton(
+                    onClick = { vm.installApk(f) },
+                    shape = RoundedCornerShape(4.dp),
+                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp),
+                    colors = ButtonDefaults.outlinedButtonColors(containerColor = Panel, contentColor = Orange)
+                ) { Text("⇩ install", fontFamily = mono, fontSize = 11.sp, maxLines = 1) }
             }
         }
         note?.let { Text(it, color = Dim, fontFamily = mono, fontSize = 10.sp) }
+    }
+}
+
+/**
+ * Full-screen WebView preview of an HTML file from the workspace. JavaScript and file access are on
+ * so a self-contained page (inline or same-directory CSS/JS) renders as it would in a browser; the
+ * base URL is the file's own directory so relative asset paths resolve.
+ */
+@Composable
+private fun HtmlPreview(file: java.io.File, onClose: () -> Unit) {
+    androidx.activity.compose.BackHandler(onBack = onClose)
+    Column(Modifier.fillMaxSize().background(Ink)) {
+        Row(
+            Modifier.fillMaxWidth().background(Panel).statusBarsPadding()
+                .padding(horizontal = 12.dp, vertical = 8.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text("▶ ${file.name}", color = Text0, fontFamily = mono, fontSize = 12.sp, maxLines = 1, modifier = Modifier.weight(1f))
+            TextButton(onClick = onClose) { Text("✕ close", color = Orange, fontFamily = mono, fontSize = 12.sp) }
+        }
+        androidx.compose.ui.viewinterop.AndroidView(
+            modifier = Modifier.fillMaxSize(),
+            factory = { ctx ->
+                android.webkit.WebView(ctx).apply {
+                    settings.javaScriptEnabled = true
+                    settings.allowFileAccess = true
+                    settings.domStorageEnabled = true
+                    @Suppress("DEPRECATION")
+                    settings.allowFileAccessFromFileURLs = true
+                    webViewClient = android.webkit.WebViewClient()
+                }
+            },
+            update = { web ->
+                val html = runCatching { file.readText() }.getOrDefault("<h1>could not read ${file.name}</h1>")
+                web.loadDataWithBaseURL(
+                    "file://${file.parent}/", html, "text/html", "utf-8", null
+                )
+            }
+        )
     }
 }
 

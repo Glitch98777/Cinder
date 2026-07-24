@@ -427,6 +427,72 @@ class Sandbox(private val ctx: Context) {
         )
         prootShim.setExecutable(true, false)
 
+        // Android's own system binaries (getprop, dumpsys, service, settings, …) live in /system/bin
+        // and are bionic, so under this SELinux domain their interpreter /system/bin/linker64 can
+        // dead-end just like proot did. Run them through the staged linker explicitly, with the flat
+        // bionic libs (which include the copied /system/lib64 set) on the library path. These shims
+        // sit first on PATH, so `getprop`, `dumpsys`, etc. Just Work for the agent.
+        for (tool in listOf(
+            "getprop", "setprop", "dumpsys", "service", "settings", "cmd", "getevent",
+            "wm", "input", "svc", "content", "am", "pm", "ime", "screencap"
+        )) {
+            val shim = File(shims, tool)
+            shim.writeText(
+                """
+                #!/bin/sh
+                # Run Android's bionic /system/bin/$tool via the staged linker so its interpreter
+                # resolves regardless of whether proot can sanitize /apex in this app's domain.
+                LNK=/usr/local/androidlibexec/linker64
+                REAL=/system/bin/$tool
+                [ -x "${'$'}REAL" ] || REAL=/system/xbin/$tool
+                if [ -x "${'$'}LNK" ] && [ -e "${'$'}REAL" ]; then
+                  exec env LD_LIBRARY_PATH=/usr/local/androidlib64:/system/lib64 \
+                    "${'$'}LNK" "${'$'}REAL" "${'$'}@"
+                else
+                  exec "${'$'}REAL" "${'$'}@"
+                fi
+                """.trimIndent() + "\n"
+            )
+            shim.setExecutable(true, false)
+        }
+
+        // install-apk <file.apk> — hand an APK the agent built to the phone's package installer.
+        // The sandbox can't install packages itself (that needs a system permission), so it drops
+        // a request the app is watching for; the app then launches the OS installer, which asks the
+        // user to confirm. The request records the guest path; the app maps it back to real storage.
+        val installApk = File(bin, "install-apk")
+        installApk.writeText(
+            """
+            #!/bin/sh
+            f="${'$'}1"
+            [ -n "${'$'}f" ] || { echo "usage: install-apk <file.apk>"; exit 2; }
+            case "${'$'}f" in /*) ;; *) f="${'$'}(pwd)/${'$'}f" ;; esac
+            [ -f "${'$'}f" ] || { echo "no such file: ${'$'}f"; exit 1; }
+            case "${'$'}f" in *.apk) ;; *) echo "not an .apk: ${'$'}f"; exit 1 ;; esac
+            mkdir -p /root/.cinder
+            printf '%s\n' "${'$'}f" > /root/.cinder/install-request
+            echo "requested install of ${'$'}f — confirm the prompt on your phone"
+            """.trimIndent() + "\n"
+        )
+        installApk.setExecutable(true, false)
+
+        // preview <file.html> — render an HTML file in an in-app WebView. Same request mechanism as
+        // install-apk: the sandbox can't open a WebView, so it drops a request the app is watching.
+        val preview = File(bin, "preview")
+        preview.writeText(
+            """
+            #!/bin/sh
+            f="${'$'}1"
+            [ -n "${'$'}f" ] || { echo "usage: preview <file.html>"; exit 2; }
+            case "${'$'}f" in /*) ;; *) f="${'$'}(pwd)/${'$'}f" ;; esac
+            [ -f "${'$'}f" ] || { echo "no such file: ${'$'}f"; exit 1; }
+            mkdir -p /root/.cinder
+            printf '%s\n' "${'$'}f" > /root/.cinder/preview-request
+            echo "opening preview of ${'$'}f on your phone"
+            """.trimIndent() + "\n"
+        )
+        preview.setExecutable(true, false)
+
         // `apk add` is the muscle memory for Alpine, and the agent will reach for it before it
         // reaches for sudo. /usr/local/bin comes first on PATH, so this shim shadows /sbin/apk
         // and routes the write-y subcommands through the fake-root helper.
