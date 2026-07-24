@@ -90,18 +90,63 @@ class Session(app: Application) : AndroidViewModel(app) {
         // Written every launch, not just on first bootstrap: an app that was already installed
         // has the stamp file, so anything added only inside bootstrap() never reaches it.
         runCatching { sandbox.writeHelpers() }
+        // Stage the bionic linker + flat libs from the app side now, so Android tools (aapt2, a
+        // nested proot) can run even though proot can't bind /apex under this SELinux domain.
+        runCatching {
+            sandbox.stageAndroidRuntime()
+            val libs = sandbox.androidLib64.list()?.size ?: 0
+            val linker = File(sandbox.androidLibexec, "linker64").exists()
+            android.util.Log.i("claudecode", "android-runtime staged: linker=$linker libs=$libs")
+            log("android runtime: linker=${if (linker) "ok" else "MISSING"}, $libs bionic libs staged")
+        }.onFailure { android.util.Log.e("claudecode", "stageAndroidRuntime failed", it) }
         cwd = sandbox.workspace.absolutePath
         refreshInstalls()
         loadHistory()
         bootstrap(force = false)
         log("android paths: " + sandbox.visibleAndroidPaths()
             .joinToString(" ") { "${it.first}=${if (it.second) "ok" else "hidden"}" })
+        inspectAndroidLibs()
         if (sandbox.hasClaude) {
             verifyEngine()
             refreshModels()
             // fakeroot is the thing that lets the agent install packages by itself; without it
             // every apk it runs dies on chown. Put it in place before the first message.
             if (!sandbox.hasFakeroot) installTools() else probeSandbox()
+        }
+    }
+
+    /**
+     * Read-only inspection of installed Android binaries and their missing NEEDED libraries. Does
+     * NOT install or modify anything — just reports state to logcat (tag "ccdiag"), so a "library
+     * not found" report can be diagnosed without guessing which tool the agent ran.
+     */
+    fun inspectAndroidLibs() {
+        if (!sandbox.hasProot || !sandbox.hasMuslLoader) return
+        viewModelScope.launch(Dispatchers.IO) {
+            val out = StringBuilder()
+            runCatching {
+                val p = sandbox.spawn("""
+                    P=/data/data/com.termux/files/usr; A=/usr/local/androidlib64
+                    echo "bins: ${'$'}(ls ${'$'}P/bin 2>/dev/null | tr '\n' ' ')"
+                    echo "selinux.so: ${'$'}(ls ${'$'}P/lib/libandroid-selinux.so 2>&1 | tail -1)"
+                    command -v patchelf >/dev/null 2>&1 || { echo "no patchelf"; exit 0; }
+                    for f in ${'$'}(find ${'$'}P/bin -type f 2>/dev/null); do
+                      head -c4 "${'$'}f" 2>/dev/null | grep -qa ELF || continue
+                      m=""
+                      for n in ${'$'}(patchelf --print-needed "${'$'}f" 2>/dev/null); do
+                        [ -e "${'$'}A/${'$'}n" ] || [ -e "${'$'}P/lib/${'$'}n" ] || m="${'$'}m ${'$'}n"
+                      done
+                      [ -n "${'$'}m" ] && echo "MISSING ${'$'}(basename ${'$'}f):${'$'}m"
+                    done
+                    echo "interp of first bin: ${'$'}(f=${'$'}(find ${'$'}P/bin -type f | head -1); patchelf --print-interpreter ${'$'}f 2>&1)"
+                """.trimIndent() + " 2>&1")
+                java.io.BufferedReader(java.io.InputStreamReader(p.inputStream))
+                    .forEachLine { out.appendLine(it.trim()) }
+                p.waitFor()
+            }
+            out.toString().trim().lines().filter { it.isNotBlank() }.forEach {
+                android.util.Log.i("ccdiag", it)
+            }
         }
     }
 

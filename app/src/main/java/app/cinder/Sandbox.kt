@@ -36,8 +36,72 @@ class Sandbox(private val ctx: Context) {
     val rootfs = File(root, "rootfs")
     val tmp = File(root, "tmp")
 
+    // Android/aarch64 (bionic) binaries — aapt2, d8, a nested proot — name /system/bin/linker64
+    // as their ELF interpreter. That's a symlink into /apex, and the app's SELinux domain
+    // (untrusted_app_27) won't let proot sanitize /apex, so the loader dead-ends: "cannot execute:
+    // required file not found". The app itself, however, IS allowed to read those files (they're
+    // labelled system_linker_exec / system_lib_file, readable by every app). So we copy the real
+    // linker and a flat set of the bionic .so files into these dirs FROM THE ANDROID SIDE, then
+    // rewrite each binary to use them — after which nothing depends on /apex resolving at runtime.
+    val androidLib64 = File(rootfs, "usr/local/androidlib64")   // flat bionic .so set
+    val androidLibexec = File(rootfs, "usr/local/androidlibexec") // copied linker64 + nested proot
+    val shims = File(rootfs, "usr/local/shims")                  // agent-facing wrappers, first on PATH
+
     fun ensureLayout() {
         listOf(home, workspace, bin, lib, libexec, rootfs, tmp).forEach { it.mkdirs() }
+    }
+
+    /** True once the bionic linker has been staged in, so [stageAndroidRuntime] can no-op fast. */
+    val androidRuntimeStaged get() = File(androidLibexec, "linker64").canExecute()
+
+    /**
+     * Copies the bionic dynamic linker and a flat set of system .so files into the rootfs using
+     * ordinary file I/O from the app's own process — the one context that can read them, since
+     * proot can't bind /apex under this SELinux domain. Idempotent: only copies what's missing, so
+     * re-running each launch is cheap once staged. android-bootstrap (inside the sandbox) then
+     * patches binaries to point at what this puts down.
+     */
+    fun stageAndroidRuntime() {
+        listOf(androidLib64, androidLibexec, shims).forEach { it.mkdirs() }
+        // Once the linker is in and a healthy set of libs is present, there's nothing to do — skip
+        // the per-launch re-scan of /apex and /system (which also spares the log some SELinux noise).
+        if (androidRuntimeStaged && (androidLib64.list()?.size ?: 0) > 50) return
+
+        val linkerDst = File(androidLibexec, "linker64")
+        if (!linkerDst.exists()) {
+            for (cand in listOf(
+                "/apex/com.android.runtime/bin/linker64", "/system/bin/linker64"
+            )) {
+                val ok = runCatching {
+                    File(cand).canonicalFile.copyTo(linkerDst, overwrite = true); true
+                }.getOrDefault(false)
+                if (ok) { linkerDst.setExecutable(true, false); break }
+            }
+        }
+
+        // The bionic libs. cp by resolving symlinks so each name is a real file in one directory
+        // the patched linker (and each lib's own rpath) can scan. Unreadable APEX partitions are
+        // simply skipped — the ones that matter (libc/m/dl, libc++, liblog, libz) are readable.
+        val srcDirs = listOf(
+            "/apex/com.android.runtime/lib64/bionic",
+            "/apex/com.android.runtime/lib64",
+            "/apex/com.android.art/lib64",
+            "/apex/com.android.i18n/lib64",
+            "/system/lib64"
+        )
+        for (d in srcDirs) {
+            val files = runCatching {
+                File(d).listFiles { f -> f.isFile && f.name.endsWith(".so") }
+            }.getOrNull() ?: continue
+            for (so in files) {
+                val dst = File(androidLib64, so.name)
+                if (!dst.exists()) runCatching { so.canonicalFile.copyTo(dst, overwrite = true) }
+            }
+        }
+
+        // Nested proot (sudo/apk and the agent's `proot`) doesn't need a patched copy: it's run
+        // through this staged linker explicitly (`linker64 proot …`), which bypasses PT_INTERP. So
+        // there's nothing else to stage here — the native proot in /usr/local/bin is reused as-is.
     }
 
     /**
@@ -157,6 +221,25 @@ class Sandbox(private val ctx: Context) {
     }
 
     /**
+     * Alpine's minirootfs enables only the **main** repo, but a lot of what the agent reaches for —
+     * patchelf (needed by android-bootstrap), build tools, editors — lives in **community**. Write
+     * both in, pinned to the rootfs's own Alpine version, so `apk add` can find them. Refreshed each
+     * launch; the apk shim fetches indexes with --no-cache so no `apk update` is required.
+     */
+    fun configureRepositories() {
+        val apk = File(rootfs, "etc/apk").apply { mkdirs() }
+        val release = runCatching { File(rootfs, "etc/alpine-release").readText().trim() }
+            .getOrNull()?.takeIf { it.isNotBlank() } ?: "3.24.0"
+        // "3.24.1" -> "v3.24"; anything unexpected falls back to the rolling edge branch.
+        val branch = Regex("""^(\d+)\.(\d+)""").find(release)?.let { "v${it.groupValues[1]}.${it.groupValues[2]}" }
+            ?: "edge"
+        val mirror = "https://dl-cdn.alpinelinux.org/alpine"
+        File(apk, "repositories").writeText(
+            "$mirror/$branch/main\n$mirror/$branch/community\n"
+        )
+    }
+
+    /**
      * [asRoot] fakes uid 0 inside the rootfs, which apk needs to install packages. The agent must
      * NOT run that way: Claude Code refuses to skip permission checks while it thinks it is root,
      * and exits 1. Package management gets root; the engine runs as the app's own uid.
@@ -182,6 +265,10 @@ class Sandbox(private val ctx: Context) {
         val proot = tool("proot")?.absolutePath ?: error("proot is not installed")
         ensureMountPoints()
         configureNetwork()
+        configureRepositories()
+        // Stage the bionic linker + flat libs in from the app side (proot can't reach /apex here).
+        // Idempotent and cheap once done; must happen before any Android binary is exec'd.
+        stageAndroidRuntime()
         // Inside the rootfs the host's PATH and LD_LIBRARY_PATH are meaningless — they point at
         // Android's bionic world, and leaving them set makes musl binaries fail to find anything.
         // Claude Code wants a POSIX shell it can drive; busybox ash is a fallback, real bash is
@@ -190,9 +277,19 @@ class Sandbox(private val ctx: Context) {
         // /system/bin is bound in, so Android's own tools — getprop, dumpsys, pm, am — are
         // reachable from inside the rootfs alongside the Alpine ones.
         val prelude = buildString {
-            append("export PATH=/usr/local/bin:/root/.npm-global/bin:/root/.local/bin:")
-            append("/data/data/com.termux/files/usr/bin:")   // Android-native tools (aapt2, d8…)
-            append("/usr/bin:/bin:/usr/sbin:/sbin:/system/bin:/system/xbin; ")
+            // /usr/local/shims is first so agent-facing wrappers (e.g. a nested-safe `proot`) win
+            // over the native binaries bound in under /usr/local/bin.
+            //
+            // CRITICAL: Alpine's own bin dirs come BEFORE Termux's. Termux ships bionic coreutils
+            // (sort, head, cut, java, …) that need libandroid-selinux.so and the linker treatment;
+            // if they shadow Alpine's reliable musl builds, ordinary commands — even the ones inside
+            // these very helper scripts (termux-install uses `sort -u`) — die with "library not
+            // found". So Alpine wins for anything it has, and Termux only supplies what Alpine lacks
+            // (aapt2, d8, apksigner — none of which exist in Alpine, so they're still found).
+            append("export PATH=/usr/local/shims:/usr/local/bin:/root/.npm-global/bin:/root/.local/bin:")
+            append("/usr/bin:/bin:/usr/sbin:/sbin:")
+            append("/data/data/com.termux/files/usr/bin:")   // Android-native tools (aapt2, d8…), after Alpine
+            append("/system/bin:/system/xbin; ")
             append("export TERMUX_PREFIX=/data/data/com.termux/files/usr; ")
             append("export ANDROID_HOME=/root/android-sdk ANDROID_SDK_ROOT=/root/android-sdk; ")
             append("export PATH=\$PATH:/root/android-sdk/gradle/bin; ")
@@ -279,19 +376,56 @@ class Sandbox(private val ctx: Context) {
             # Fake root by re-entering the rootfs through a nested proot -0. This is the only
             # elevation that works on Android: fakeroot needs a SysV-IPC daemon (absent from the
             # kernel), and the files are already ours anyway — apk only refuses to run unless it
-            # believes it is uid 0, which -0 provides. Verified: real apk then installs full
-            # dependency trees and the musl JVM runs.
+            # believes it is uid 0, which -0 provides.
+            #
+            # The catch: proot is itself a bionic binary, and under this app's SELinux domain
+            # (untrusted_app_27) its ELF interpreter /system/bin/linker64 can't be resolved — proot
+            # can't sanitize /apex — so a plain `exec proot` dies with "proot: not found". The staged
+            # bionic linker fixes it: invoke it EXPLICITLY as `linker64 proot ...`, which bypasses
+            # PT_INTERP entirely. LD_LIBRARY_PATH supplies proot's own libs (libtalloc) + bionic libc.
+            # Verified on-device with no /apex bound: real apk then installs full dependency trees.
             mkdir -p /tmp
-            PROOT_LOADER=/usr/local/libexec/loader \
-            PROOT_LOADER_32=/usr/local/libexec/loader32 \
-            PROOT_TMP_DIR=/tmp \
-            LD_LIBRARY_PATH=/usr/local/androidlib \
-            exec /usr/local/bin/proot -0 -r / \
-              -b /system:/system -b /apex:/apex -b /proc:/proc -b /dev:/dev -b /sys:/sys \
-              -w "${'$'}PWD" "${'$'}@"
+            LNK=/usr/local/androidlibexec/linker64
+            if [ -x "${'$'}LNK" ]; then
+              exec env PROOT_LOADER=/usr/local/libexec/loader \
+                PROOT_LOADER_32=/usr/local/libexec/loader32 \
+                PROOT_TMP_DIR=/tmp \
+                LD_LIBRARY_PATH=/usr/local/androidlib64:/usr/local/androidlib \
+                "${'$'}LNK" /usr/local/bin/proot -0 -r / \
+                  -b /system:/system -b /apex:/apex -b /proc:/proc -b /dev:/dev -b /sys:/sys \
+                  -w "${'$'}PWD" "${'$'}@"
+            else
+              # No staged linker (e.g. rooted device / shell domain where the native interp resolves).
+              PROOT_LOADER=/usr/local/libexec/loader PROOT_LOADER_32=/usr/local/libexec/loader32 \
+              PROOT_TMP_DIR=/tmp LD_LIBRARY_PATH=/usr/local/androidlib \
+              exec /usr/local/bin/proot -0 -r / \
+                -b /system:/system -b /apex:/apex -b /proc:/proc -b /dev:/dev -b /sys:/sys \
+                -w "${'$'}PWD" "${'$'}@"
+            fi
             """.trimIndent() + "\n"
         )
         sudo.setExecutable(true, false)
+
+        // A nested-safe `proot` for the agent. /usr/local/shims is first on PATH, so this shadows
+        // the native /usr/local/bin/proot (which the app launches the OUTER sandbox with and must
+        // stay unpatched). Same explicit-linker trick as sudo — no patchelf needed, works at once.
+        shims.mkdirs()
+        val prootShim = File(shims, "proot")
+        prootShim.writeText(
+            """
+            #!/bin/sh
+            LNK=/usr/local/androidlibexec/linker64
+            if [ -x "${'$'}LNK" ]; then
+              exec env PROOT_LOADER=/usr/local/libexec/loader \
+                PROOT_LOADER_32=/usr/local/libexec/loader32 PROOT_TMP_DIR=/tmp \
+                LD_LIBRARY_PATH=/usr/local/androidlib64:/usr/local/androidlib \
+                "${'$'}LNK" /usr/local/bin/proot "${'$'}@"
+            else
+              exec /usr/local/bin/proot "${'$'}@"
+            fi
+            """.trimIndent() + "\n"
+        )
+        prootShim.setExecutable(true, false)
 
         // `apk add` is the muscle memory for Alpine, and the agent will reach for it before it
         // reaches for sudo. /usr/local/bin comes first on PATH, so this shim shadows /sbin/apk
@@ -439,10 +573,135 @@ class Sandbox(private val ctx: Context) {
         )
         apkShim.setExecutable(true, false)
 
+        // The crux of running Android/aarch64 (bionic) binaries in here at all.
+        //
+        // A Termux binary like aapt2 has its ELF interpreter set to /system/bin/linker64 — which
+        // on modern Android is only a symlink into /apex/com.android.runtime, a chain proot can't
+        // reliably canonicalise (hence the old "can't sanitize binding /apex" and "linker64: not
+        // found"). It also expects its .so files under $PREFIX/lib and the bionic partitions,
+        // which likewise don't survive translation.
+        //
+        // The fix is to stop depending on any of that resolving: copy the REAL linker and a flat
+        // set of the bionic .so files out of the bound host tree into fixed rootfs paths, then
+        // rewrite every Android ELF so its interpreter and rpath point straight at them. After
+        // this the binaries are self-contained and run without /apex or /system needing to work.
+        val abootstrap = File(bin, "android-bootstrap")
+        abootstrap.writeText(
+            """
+            #!/bin/sh
+            # Make Android/aarch64 (bionic) binaries self-contained inside this rootfs. The linker
+            # and flat bionic libs are staged in from the app side (proot can't read /apex under
+            # this SELinux domain); this script does the patchelf pass. Safe to re-run any time an
+            # Android binary reports "not found" for its loader or a library.
+            set -e
+            ALIB=/usr/local/androidlib64           # flat directory of bionic .so files (app-staged)
+            ALIBEXEC=/usr/local/androidlibexec      # the copied dynamic linker + nested proot
+            PREFIX=/data/data/com.termux/files/usr
+            mkdir -p "${'$'}ALIB" "${'$'}ALIBEXEC" /usr/local/shims
+
+            # Fallback: if app-side staging didn't run for some reason, try copying from inside (works
+            # only where /apex is reachable). Normally the linker is already here.
+            if [ ! -x "${'$'}ALIBEXEC/linker64" ]; then
+              for cand in /apex/com.android.runtime/bin/linker64 /system/bin/linker64; do
+                [ -e "${'$'}cand" ] && cp -L "${'$'}cand" "${'$'}ALIBEXEC/linker64" 2>/dev/null && chmod 755 "${'$'}ALIBEXEC/linker64" && break
+              done
+              for d in /apex/com.android.runtime/lib64/bionic /apex/com.android.runtime/lib64 /apex/com.android.art/lib64 /apex/com.android.i18n/lib64 /system/lib64; do
+                [ -d "${'$'}d" ] || continue
+                for so in "${'$'}d"/*.so; do [ -e "${'$'}so" ] || continue; b=${'$'}(basename "${'$'}so"); [ -e "${'$'}ALIB/${'$'}b" ] || cp -L "${'$'}so" "${'$'}ALIB/${'$'}b" 2>/dev/null || true; done
+              done
+            fi
+            [ -x "${'$'}ALIBEXEC/linker64" ] || { echo "! no linker64 staged — Android binaries can't run"; exit 1; }
+            echo "linker + ${'$'}(ls -1 "${'$'}ALIB" 2>/dev/null | wc -l) bionic libs staged"
+
+            # patchelf lives in Alpine's community repo. The app writes both main+community into
+            # /etc/apk/repositories, but if this rootfs predates that (or the file got reset), enable
+            # community here too and retry — patchelf is essential to the patch pass.
+            if ! command -v patchelf >/dev/null 2>&1; then
+              apk add patchelf >/dev/null 2>&1 || true
+              if ! command -v patchelf >/dev/null 2>&1; then
+                REL=${'$'}(cut -d. -f1,2 /etc/alpine-release 2>/dev/null || echo edge)
+                REPO=/etc/apk/repositories
+                grep -q '/community' "${'$'}REPO" 2>/dev/null || \
+                  echo "https://dl-cdn.alpinelinux.org/alpine/v${'$'}REL/community" >> "${'$'}REPO"
+                echo "enabling community repo and retrying patchelf..."
+                apk add patchelf 2>&1 | grep -vi 'inconsistent' | tail -2 || true
+              fi
+            fi
+            command -v patchelf >/dev/null 2>&1 || {
+              echo "! patchelf still unavailable (apk/network problem). Check: apk add patchelf"; exit 1; }
+            RPATH="${'$'}ALIB:${'$'}PREFIX/lib"
+
+            # (a) Executables and libraries under the termux prefix (aapt2, d8's libs, …). An
+            #     executable gets a new interpreter AND rpath; a .so gets rpath only.
+            PATCHED=0; EXES=0
+            patch_tree() {
+              [ -d "${'$'}1" ] || return 0
+              for f in ${'$'}(find "${'$'}1" -type f 2>/dev/null); do
+                head -c4 "${'$'}f" 2>/dev/null | grep -qa 'ELF' || continue
+                if patchelf --print-interpreter "${'$'}f" >/dev/null 2>&1; then
+                  patchelf --set-interpreter "${'$'}ALIBEXEC/linker64" "${'$'}f" 2>/dev/null && EXES=${'$'}((EXES+1))
+                  echo "  interp+rpath: ${'$'}(basename "${'$'}f")"
+                fi
+                patchelf --set-rpath "${'$'}RPATH" "${'$'}f" 2>/dev/null && PATCHED=${'$'}((PATCHED+1))
+              done
+            }
+            for base in "${'$'}@" "${'$'}PREFIX/bin" "${'$'}PREFIX/lib"; do patch_tree "${'$'}base"; done
+            echo "patched ${'$'}PATCHED ELF file(s) under the prefix (${'$'}EXES executable interpreters rewritten)"
+
+            # (b) The flat bionic libs themselves. rpath on an executable only covers ITS direct
+            #     deps; a transitive dep (liblog -> libc++) resolves via the intermediate lib's own
+            #     runpath. Give every flat lib an rpath back to the flat dir so the whole graph
+            #     resolves with no /apex and no /system.
+            n=0
+            for so in "${'$'}ALIB"/*.so; do
+              [ -e "${'$'}so" ] || continue
+              patchelf --set-rpath "${'$'}ALIB" "${'$'}so" 2>/dev/null && n=${'$'}((n+1))
+            done
+            echo "rpath set on ${'$'}n flat libs"
+
+            # (c) Self-heal missing dependencies. If any installed Android executable still NEEDs a
+            #     library that's in neither the flat dir nor the termux prefix, install the Termux
+            #     package of the same base name (libandroid-selinux.so -> libandroid-selinux) and
+            #     re-patch. Guarded so the termux-install it calls doesn't recurse back into repair.
+            if [ -z "${'$'}CC_NO_REPAIR" ]; then
+              # Index every shared object already present ANYWHERE under the flat dir or the prefix,
+              # so libs that live in subdirectories (e.g. the JVM's libjvm.so under lib/jvm/…) are
+              # not falsely flagged missing — checking only ${'$'}PREFIX/lib produced bogus installs.
+              find "${'$'}ALIB" "${'$'}PREFIX" -name '*.so*' -type f 2>/dev/null | sed 's#.*/##' | sort -u > /tmp/have-libs
+              miss=""
+              for f in ${'$'}(find "${'$'}PREFIX/bin" "${'$'}PREFIX/lib" -maxdepth 1 -type f 2>/dev/null); do
+                head -c4 "${'$'}f" 2>/dev/null | grep -qa 'ELF' || continue
+                for need in ${'$'}(patchelf --print-needed "${'$'}f" 2>/dev/null); do
+                  grep -qxF "${'$'}need" /tmp/have-libs && continue
+                  case " ${'$'}miss " in *" ${'$'}need "*) ;; *) miss="${'$'}miss ${'$'}need" ;; esac
+                done
+              done
+              if [ -n "${'$'}miss" ]; then
+                pkgs=""
+                for nlib in ${'$'}miss; do pkgs="${'$'}pkgs ${'$'}{nlib%.so*}"; done
+                echo "missing libs:${'$'}miss"
+                echo "installing termux packages:${'$'}pkgs"
+                CC_NO_REPAIR=1 termux-install ${'$'}pkgs 2>&1 | grep -E '^[[:space:]]*[+!]' || true
+                # re-apply rpath so the newly landed libs are found by everything
+                RP="${'$'}ALIB:${'$'}PREFIX/lib"
+                for so in ${'$'}(find "${'$'}PREFIX/lib" -maxdepth 1 -name '*.so*' -type f 2>/dev/null); do
+                  patchelf --set-rpath "${'$'}RP" "${'$'}so" 2>/dev/null || true
+                done
+                echo "repair pass complete"
+              else
+                echo "all NEEDED libs already present"
+              fi
+            fi
+            echo "android-bootstrap done"
+            """.trimIndent() + "\n"
+        )
+        abootstrap.setExecutable(true, false)
+
         // Alpine's repo has no Android build tools, and Google ships aapt2/d8/NDK as x86-64
         // Linux binaries that cannot run here at all. Termux publishes aarch64 builds of the same
-        // tools for Android's own libc — and those DO run inside this sandbox now that /system
-        // and /apex are bound. They expect to live at Termux's own prefix, so install them there.
+        // tools for Android's own libc — and those run inside this sandbox once android-bootstrap
+        // has copied the bionic linker + libs in and rewritten their ELF headers. They expect to
+        // live at Termux's own prefix, so install them there.
         val termux = File(bin, "termux-install")
         termux.writeText(
             """
@@ -459,8 +718,12 @@ class Sandbox(private val ctx: Context) {
             PREFIX=/data/data/com.termux/files/usr
 
             [ ${'$'}# -gt 0 ] || { echo "usage: termux-install <package>..."; exit 2; }
-            command -v dpkg >/dev/null 2>&1 || apk add dpkg >/dev/null 2>&1
+            command -v dpkg-deb >/dev/null 2>&1 || apk add dpkg >/dev/null 2>&1
             command -v wget >/dev/null 2>&1 || apk add wget >/dev/null 2>&1
+            # dpkg-deb shells out to `tar --warning=...` and needs xz/zstd to decompress data.tar.*.
+            # BusyBox tar (Alpine's default, now first on PATH) rejects GNU's --warning flag, so a
+            # real GNU tar plus the compressors must be installed or every .deb extract fails.
+            apk add tar xz zstd >/dev/null 2>&1 || true
 
             if [ ! -s "${'$'}MAP" ]; then
               echo "fetching package index..."
@@ -473,29 +736,41 @@ class Sandbox(private val ctx: Context) {
               ' "${'$'}IDX"
             fi
 
-            RESOLVED=" "
-            ORDER=""
-            resolve() {   # depth-first: dependencies land before the package that needs them
-              p=${'$'}1
-              case "${'$'}RESOLVED" in *" ${'$'}p "*) return ;; esac
-              RESOLVED="${'$'}RESOLVED${'$'}p "
-              for d in ${'$'}(grep -m1 "^${'$'}p	" "${'$'}DEP" | cut -f2); do resolve "${'$'}d"; done
-              ORDER="${'$'}ORDER ${'$'}p"
-            }
-            for pkg in "${'$'}@"; do resolve "${'$'}pkg"; done
+            # Dependency closure by FIXPOINT, not recursion. A recursive resolver with shell-var
+            # state (RESOLVED/ORDER) silently drops packages under busybox ash — its globals don't
+            # survive the nested calls, so e.g. coreutils' libandroid-selinux went missing and the
+            # binary died with "library not found". Iterating a WANT set to a fixpoint has no such
+            # trap. Install order is irrelevant here: these are libraries and standalone tools, and
+            # dpkg -x only extracts files (no maintainer scripts run).
+            WANT=/tmp/termux-want
+            printf "%s\n" "${'$'}@" | sort -u > "${'$'}WANT"
+            while : ; do
+              before=${'$'}(wc -l < "${'$'}WANT")
+              while IFS= read -r p; do grep -m1 "^${'$'}p	" "${'$'}DEP" | cut -f2; done < "${'$'}WANT" \
+                | tr " " "\n" | grep -v "^${'$'}" >> "${'$'}WANT"
+              sort -u "${'$'}WANT" -o "${'$'}WANT"
+              [ "${'$'}(wc -l < "${'$'}WANT")" = "${'$'}before" ] && break
+            done
 
             mkdir -p "${'$'}PREFIX/bin" "${'$'}PREFIX/lib"
-            echo "resolved ${'$'}(echo ${'$'}ORDER | wc -w) packages, installing..."
-            for p in ${'$'}ORDER; do
+            echo "resolved ${'$'}(wc -l < "${'$'}WANT") packages (full closure), installing..."
+            while IFS= read -r p; do
               file=${'$'}(grep -m1 "^${'$'}p	" "${'$'}MAP" | cut -f2)
               [ -n "${'$'}file" ] || continue    # virtual/provided names have no .deb
-              if wget -qO /tmp/t.deb "${'$'}REPO/${'$'}file" 2>/dev/null && dpkg -x /tmp/t.deb / 2>/dev/null; then
-                echo "  + ${'$'}p"
+              if ! wget -qO /tmp/t.deb "${'$'}REPO/${'$'}file" 2>/tmp/werr; then
+                echo "  ! ${'$'}p (download failed: ${'$'}(head -1 /tmp/werr 2>/dev/null))"
+              # dpkg-deb -x shells out to `tar --warning=...`, a GNU flag BusyBox tar (Alpine's
+              # default) rejects. --fsys-tarfile instead streams the decompressed data tarball to
+              # stdout (using its own xz/zst handling, no tar), which we extract with a plain BusyBox
+              # tar call. Sidesteps the tar-flavour problem entirely.
+              elif ! { dpkg-deb --fsys-tarfile /tmp/t.deb > /tmp/data.tar 2>/tmp/derr && \
+                       tar -xf /tmp/data.tar -C / 2>>/tmp/derr; }; then
+                echo "  ! ${'$'}p (extract failed: ${'$'}(head -1 /tmp/derr 2>/dev/null))"
               else
-                echo "  ! ${'$'}p (skipped)"
+                echo "  + ${'$'}p"
               fi
-              rm -f /tmp/t.deb
-            done
+              rm -f /tmp/t.deb /tmp/data.tar
+            done < "${'$'}WANT"
             # Termux's wrapper scripts start with #!/data/data/com.termux/files/usr/bin/sh, a path
             # that only exists inside Termux. Point the usual names at Alpine's equivalents so
             # those scripts can actually run here.
@@ -506,6 +781,12 @@ class Sandbox(private val ctx: Context) {
                 [ -n "${'$'}real" ] && ln -sf "${'$'}real" "${'$'}PREFIX/bin/${'$'}name"
               fi
             done
+
+            # Android binaries as shipped point their ELF interpreter at /system/bin/linker64 and
+            # hunt for .so files across the bionic partitions — neither survives into this rootfs.
+            # Make them self-contained: copy the linker + a flat lib set in and rewrite each ELF.
+            echo "==> making Android binaries self-contained (linker + flat libs)"
+            android-bootstrap "${'$'}PREFIX/bin" "${'$'}PREFIX/lib" || echo "  ! android-bootstrap failed"
 
             echo "installed under ${'$'}PREFIX (already on PATH)"
             """.trimIndent() + "\n"
@@ -583,10 +864,10 @@ class Sandbox(private val ctx: Context) {
             #!/bin/sh
             # APK tooling, all running on Alpine's own musl JVM.
             #
-            # Termux builds are Android binaries: their ELF interpreter is /system/bin/linker64,
-            # which is a symlink into /apex. Neither reliably survives into this rootfs, so those
-            # fail with "cannot execute: required file not found". apktool, jadx and dex2jar are
-            # pure Java, so they need no native Android anything — only a JVM that works.
+            # apktool, jadx and dex2jar are pure Java, so they need no native Android anything —
+            # only a JVM that works. (Native Android binaries like aapt2 are handled separately by
+            # android-bootstrap, which copies the bionic linker + libs in; these tools skip all of
+            # that by running on Alpine's own musl JVM.)
             set -e
             LIB=/usr/local/lib
             mkdir -p "${'$'}LIB"

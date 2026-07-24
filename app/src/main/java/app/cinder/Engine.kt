@@ -38,9 +38,11 @@ private val SANDBOX_BRIEF = listOf(
     "To take an APK apart: apktool d <apk> (smali + resources), jadx <apk> (Java source).",
     "baksmali <apk> [out] and smali <dir> [out.apk] are shims onto apktool, which embeds both.",
     "If those are missing, run apk-tools-install once — it installs Alpine's JDK and the jars.",
-    "Important: Termux/Android binaries generally cannot run in this rootfs — their ELF interpreter " +
-        "is /system/bin/linker64, a symlink into /apex that isn't reliably visible here. Prefer " +
-        "Alpine packages (apk add) and pure-Java tools, which run on the musl JVM.",
+    "Termux/Android binaries DO run here: their ELF interpreter is /system/bin/linker64 (a symlink " +
+        "into /apex that proot can't resolve), so termux-install runs android-bootstrap, which copies " +
+        "the real bionic linker plus a flat set of .so files into the rootfs and rewrites each binary's " +
+        "interpreter and rpath to use them. If an Android binary ever reports 'not found' for its loader " +
+        "or a library, just run: android-bootstrap — it re-copies and re-patches everything.",
     "Those land in /data/data/com.termux/files/usr and are already on PATH. Cross-compilers: termux-install clang binutils make cmake.",
     "Android's own tools are on PATH too (getprop, pm, am, dumpsys) since /system is mounted.",
     "Files you create in /workspace can be opened by the user from the app, so mention their paths."
