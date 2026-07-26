@@ -286,7 +286,7 @@ class Session(app: Application) : AndroidViewModel(app) {
         }
         busy = true
         awaitingFreshTurn = false   // startOrResumeEngine sets this true only when it resumes
-        status = "thinking"
+        status = "working"
         // The CLI insists on a POSIX shell, and Alpine's minirootfs has only busybox ash. Pull
         // bash in on the first message rather than making it a setup chore.
         if (!sandbox.hasBash || !sandbox.hasFakeroot) {
@@ -530,7 +530,7 @@ class Session(app: Application) : AndroidViewModel(app) {
             is Event.Thinking -> {
                 if (!busy) busy = true
                 awaitingFreshTurn = false
-                status = "thinking"
+                status = "working"
                 // Consecutive thinking blocks are one stretch of reasoning, not several.
                 val last = transcript.lastOrNull()
                 if (last is Turn.Thinking && event.text.isBlank()) return@launch
