@@ -1228,13 +1228,56 @@ class Session(app: Application) : AndroidViewModel(app) {
      * sandbox, so the app reads that rather than holding a key of its own — an OAuth token goes on
      * Authorization: Bearer and needs the oauth beta header, unlike an API key.
      */
+    /** Where the CLI may have written its OAuth credential, most likely first. */
+    private fun credentialFiles(): List<File> {
+        // CLAUDE_CONFIG_DIR is an absolute HOST path (…/files/home/.claude). The CLI runs inside
+        // proot, where that same path has no matching bind, so it lands UNDER THE ROOTFS — that's
+        // where the credential actually is. Reconstruct that location, plus the plain layouts.
+        val cfg = File(sandbox.home, ".claude").absolutePath.trimStart('/')
+        return listOf(
+            File(sandbox.rootfs, "$cfg/.credentials.json"),
+            File(sandbox.rootfs, "$cfg/credentials.json"),
+            File(sandbox.home, ".claude/.credentials.json"),
+            File(sandbox.home, ".config/claude/.credentials.json"),
+            File(sandbox.home, ".claude/credentials.json")
+        )
+    }
+
+    /** Pulls the OAuth access token out of whichever credential file exists, tolerating layout drift. */
+    private fun readOAuthToken(): String? {
+        fun extract(f: File): String? {
+            val json = runCatching { JSONObject(f.readText()) }.getOrNull() ?: return null
+            // Known shapes: { claudeAiOauth: { accessToken } } and a flatter { accessToken }.
+            return json.optJSONObject("claudeAiOauth")?.optString("accessToken")?.takeIf { it.isNotBlank() }
+                ?: json.optString("accessToken").takeIf { it.isNotBlank() }
+        }
+        // Fast path: the layouts we know about.
+        credentialFiles().firstOrNull { it.exists() }?.let { extract(it)?.let { t -> return t } }
+        // Fallback: layouts drift between CLI versions, so hunt for any *credentials.json anywhere
+        // under the whole sandbox (home AND the rootfs, where CLAUDE_CONFIG_DIR currently resolves).
+        return runCatching {
+            sandbox.root.walkTopDown().maxDepth(10)
+                .filter { it.isFile && it.name.endsWith("credentials.json") }
+                .firstNotNullOfOrNull { f ->
+                    extract(f)?.also { log("models: using credential ${f.relativeTo(sandbox.root)}") }
+                }
+        }.getOrNull()
+    }
+
     fun refreshModels() {
         viewModelScope.launch(Dispatchers.IO) {
-            val token = runCatching {
-                val f = File(sandbox.home, ".claude/.credentials.json")
-                JSONObject(f.readText()).getJSONObject("claudeAiOauth").getString("accessToken")
-            }.getOrNull()
-            if (token == null) { log("models: not signed in yet"); return@launch }
+            val token = readOAuthToken()
+            if (token == null) {
+                // Diagnostic: where do any credentials.json actually live under the sandbox?
+                val found = runCatching {
+                    sandbox.root.walkTopDown().maxDepth(10)
+                        .filter { it.isFile && it.name.endsWith("credentials.json") }
+                        .map { it.relativeTo(sandbox.root).path }.toList()
+                }.getOrDefault(emptyList())
+                android.util.Log.i("ccmodels", "no token. credentials.json found at: $found")
+                log("models: not signed in yet (no credential found)")
+                return@launch
+            }
 
             runCatching {
                 val conn = (URL("https://api.anthropic.com/v1/models?limit=100").openConnection()
