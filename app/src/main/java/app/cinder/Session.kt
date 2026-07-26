@@ -70,6 +70,13 @@ class Session(app: Application) : AndroidViewModel(app) {
         private set
     var status by mutableStateOf("idle")
         private set
+
+    /** True while the model is producing output this turn; drives the live "responding…" marker. */
+    var responding by mutableStateOf(false)
+        private set
+    /** Rough count of output tokens produced so far this turn (~4 chars/token). */
+    var responseTokens by mutableStateOf(0)
+        private set
     var setupLog by mutableStateOf("")
         private set
     var installs by mutableStateOf(listOf<Install>())
@@ -286,6 +293,8 @@ class Session(app: Application) : AndroidViewModel(app) {
         }
         busy = true
         awaitingFreshTurn = false   // startOrResumeEngine sets this true only when it resumes
+        responding = false          // no output yet this turn
+        responseTokens = 0
         status = "working"
         // The CLI insists on a POSIX shell, and Alpine's minirootfs has only busybox ash. Pull
         // bash in on the first message rather than making it a setup chore.
@@ -454,6 +463,7 @@ class Session(app: Application) : AndroidViewModel(app) {
         pendingSend = null
         engine.stop()
         busy = false
+        responding = false
         status = "stopped"
         transcript.add(Turn.Notice("Interrupted"))
     }
@@ -524,12 +534,16 @@ class Session(app: Application) : AndroidViewModel(app) {
                 // send() path never marked busy). Done flips it back off at the end.
                 if (!busy) busy = true
                 awaitingFreshTurn = false   // real output for this turn has begun
+                responding = true
+                responseTokens += (event.text.length + 3) / 4   // ~4 chars per token
                 transcript.add(Turn.Assistant(event.text))
             }
 
             is Event.Thinking -> {
                 if (!busy) busy = true
                 awaitingFreshTurn = false
+                responding = true
+                responseTokens += (event.text.length + 3) / 4
                 status = "working"
                 // Consecutive thinking blocks are one stretch of reasoning, not several.
                 val last = transcript.lastOrNull()
@@ -596,6 +610,7 @@ class Session(app: Application) : AndroidViewModel(app) {
                     return@launch
                 }
                 busy = false
+                responding = false
                 status = "idle"
                 saveCurrent()   // a completed turn is worth keeping
                 val cost = event.costUsd?.let { "$%.4f".format(it) }

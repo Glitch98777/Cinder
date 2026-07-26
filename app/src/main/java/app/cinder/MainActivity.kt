@@ -22,10 +22,16 @@ import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.tween
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -285,8 +291,8 @@ private fun ModelPicker(vm: Session) {
 private fun ChatTab(vm: Session) {
     val listState = rememberLazyListState()
     val scope = rememberCoroutineScope()
-    LaunchedEffect(vm.transcript.size) {
-        if (vm.transcript.isNotEmpty()) scope.launch { listState.animateScrollToItem(vm.transcript.size - 1) }
+    LaunchedEffect(vm.transcript.size, vm.responding) {
+        if (vm.transcript.isNotEmpty()) scope.launch { listState.animateScrollToItem(vm.transcript.size) }
     }
     Column(Modifier.fillMaxSize()) {
         LazyColumn(
@@ -297,8 +303,29 @@ private fun ChatTab(vm: Session) {
         ) {
             if (vm.transcript.isEmpty()) item { Welcome() }
             items(vm.transcript) { TurnRow(it) }
+            if (vm.responding) item { RespondingMarker(vm.responseTokens) }
         }
         Composer(vm)
+    }
+}
+
+/**
+ * Live marker shown while the model is producing output. Claude Code sends complete message blocks
+ * rather than a token stream, so this reflects how much has arrived so far — a rough ~4-chars-per-
+ * token estimate that ticks up as each block lands.
+ */
+@Composable
+private fun RespondingMarker(tokens: Int) {
+    val alpha by rememberInfiniteTransition(label = "pulse").animateFloat(
+        initialValue = 0.35f, targetValue = 1f,
+        animationSpec = infiniteRepeatable(tween(700), RepeatMode.Reverse), label = "pulse"
+    )
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        Text("⏺", color = Orange, fontSize = 12.sp, modifier = Modifier.graphicsLayer { this.alpha = alpha })
+        Spacer(Modifier.width(6.dp))
+        Text("responding…", color = Text0, fontFamily = mono, fontSize = 12.sp)
+        Spacer(Modifier.width(8.dp))
+        Text("~$tokens tokens", color = Dim, fontFamily = mono, fontSize = 11.sp)
     }
 }
 
