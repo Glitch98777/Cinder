@@ -240,10 +240,14 @@ class Sandbox(private val ctx: Context) {
     }
 
     /**
-     * Alpine's minirootfs enables only the **main** repo, but a lot of what the agent reaches for —
-     * patchelf (needed by android-bootstrap), build tools, editors — lives in **community**. Write
-     * both in, pinned to the rootfs's own Alpine version, so `apk add` can find them. Refreshed each
-     * launch; the apk shim fetches indexes with --no-cache so no `apk update` is required.
+     * Alpine's minirootfs enables only the **main** repo, but the agent needs far more — patchelf,
+     * build tools, editors (community), and the long tail of packages including ones that only
+     * exist for aarch64 on the rolling branches, like **wine** (edge/community). Enable the whole
+     * archive: the rootfs's own stable main+community, plus edge main+community and edge/testing.
+     * Refreshed each launch; the apk shim fetches indexes with --no-cache so no `apk update` needed.
+     *
+     * Mixing edge into a stable base is normally discouraged, but apk only pulls the closure of what
+     * you actually `apk add`, so it stays bounded — and it's what makes `apk add wine` resolve at all.
      */
     fun configureRepositories() {
         val apk = File(rootfs, "etc/apk").apply { mkdirs() }
@@ -254,7 +258,15 @@ class Sandbox(private val ctx: Context) {
             ?: "edge"
         val mirror = "https://dl-cdn.alpinelinux.org/alpine"
         File(apk, "repositories").writeText(
-            "$mirror/$branch/main\n$mirror/$branch/community\n"
+            buildString {
+                // the rootfs's own stable release — preferred for the base system
+                append("$mirror/$branch/main\n")
+                append("$mirror/$branch/community\n")
+                // the rolling archive: everything else Alpine builds for aarch64, incl. wine
+                append("$mirror/edge/main\n")
+                append("$mirror/edge/community\n")
+                append("$mirror/edge/testing\n")
+            }
         )
     }
 

@@ -30,6 +30,10 @@ private val SANDBOX_BRIEF = listOf(
     "System packages: apk add <pkg> / apk del <pkg>. These run real apk elevated via nested proot, " +
         "so full dependency trees install. You'll see a harmless 'database inconsistent' note at the " +
         "end — ignore it, the files are already installed and work.",
+    "The full Alpine archive is enabled — stable main+community plus edge main/community/testing — " +
+        "so the whole aarch64 package set is installable, including wine: apk add wine works. (wine " +
+        "runs Windows PE binaries; on this ARM sandbox that means ARM64 ones, and there's no display, " +
+        "so GUIs won't show — but it installs and CLI/headless use is possible.)",
     "npm install -g works: the prefix is /root/.npm-global, already on PATH.",
     "pip install works: it installs to /root/.local (PIP_USER is set), also on PATH. Use python3/pip3.",
     "If a language runtime is missing, install it first: apk add nodejs npm python3 py3-pip openjdk17 go rust.",
