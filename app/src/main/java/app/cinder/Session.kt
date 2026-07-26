@@ -77,6 +77,9 @@ class Session(app: Application) : AndroidViewModel(app) {
     /** Rough count of output tokens produced so far this turn (~4 chars/token). */
     var responseTokens by mutableStateOf(0)
         private set
+    private var responseChars = 0
+    /** True once we've seen a streamed delta this turn, so complete messages don't double-count. */
+    private var sawDelta = false
     var setupLog by mutableStateOf("")
         private set
     var installs by mutableStateOf(listOf<Install>())
@@ -295,6 +298,8 @@ class Session(app: Application) : AndroidViewModel(app) {
         awaitingFreshTurn = false   // startOrResumeEngine sets this true only when it resumes
         responding = false          // no output yet this turn
         responseTokens = 0
+        responseChars = 0
+        sawDelta = false
         status = "working"
         // The CLI insists on a POSIX shell, and Alpine's minirootfs has only busybox ash. Pull
         // bash in on the first message rather than making it a setup chore.
@@ -535,15 +540,26 @@ class Session(app: Application) : AndroidViewModel(app) {
                 if (!busy) busy = true
                 awaitingFreshTurn = false   // real output for this turn has begun
                 responding = true
-                responseTokens += (event.text.length + 3) / 4   // ~4 chars per token
+                // Deltas already counted the text live; only count here if partial streaming isn't
+                // giving us deltas, so the number still lands on the final block.
+                if (!sawDelta) { responseChars += event.text.length; responseTokens = responseChars / 4 }
                 transcript.add(Turn.Assistant(event.text))
+            }
+
+            is Event.Delta -> {
+                if (!busy) busy = true
+                awaitingFreshTurn = false
+                responding = true
+                sawDelta = true
+                responseChars += event.text.length
+                responseTokens = responseChars / 4
             }
 
             is Event.Thinking -> {
                 if (!busy) busy = true
                 awaitingFreshTurn = false
                 responding = true
-                responseTokens += (event.text.length + 3) / 4
+                if (!sawDelta) { responseChars += event.text.length; responseTokens = responseChars / 4 }
                 status = "working"
                 // Consecutive thinking blocks are one stretch of reasoning, not several.
                 val last = transcript.lastOrNull()

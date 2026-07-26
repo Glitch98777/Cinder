@@ -66,6 +66,8 @@ sealed interface Event {
     data class Message(val text: String) : Event
     /** A thinking block. Its text is empty unless the CLI is set to summarize reasoning. */
     data class Thinking(val text: String) : Event
+    /** A small chunk of streamed output text (from --include-partial-messages), for live counting. */
+    data class Delta(val text: String) : Event
     /** The model called a tool: Read, Edit, Write, Bash, Glob, … */
     data class ToolCall(val id: String, val name: String, val input: JSONObject) : Event
     /** The result that came back for a tool call. */
@@ -109,6 +111,9 @@ class Engine(private val sandbox: Sandbox, private val scope: CoroutineScope) {
             append("--print ")
             append("--input-format stream-json ")
             append("--output-format stream-json ")
+            // Emit incremental text deltas (stream_event frames) so the UI can show a live token
+            // count as the response is produced, instead of one block at the very end.
+            append("--include-partial-messages ")
             // Headless has no way to answer a permission prompt: an unattended request is simply
             // declined, which is what turned every Write into "permission denied". The workspace
             // is app-private and disposable, so the sandbox grants them up front.
@@ -201,6 +206,19 @@ class Engine(private val sandbox: Sandbox, private val scope: CoroutineScope) {
     private fun parse(line: String, onEvent: (Event) -> Unit) {
         val json = runCatching { JSONObject(line) }.getOrNull() ?: return
         when (json.optString("type")) {
+            // Partial-message frames: a stream of Anthropic SSE events. We only want the text and
+            // thinking deltas, purely to drive the live token counter — the transcript still uses
+            // the complete assistant message that arrives at the end of the block.
+            "stream_event" -> {
+                val ev = json.optJSONObject("event") ?: return
+                if (ev.optString("type") == "content_block_delta") {
+                    val delta = ev.optJSONObject("delta")
+                    val text = delta?.optString("text").orEmpty()
+                        .ifEmpty { delta?.optString("thinking").orEmpty() }
+                    if (text.isNotEmpty()) onEvent(Event.Delta(text))
+                }
+            }
+
             "system" -> if (json.optString("subtype") == "init") {
                 val tools = json.optJSONArray("tools")?.let { arr ->
                     (0 until arr.length()).map { arr.optString(it) }
