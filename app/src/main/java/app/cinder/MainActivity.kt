@@ -241,6 +241,7 @@ private fun Header(vm: Session, tab: Tab, onMenu: () -> Unit, onTab: (Tab) -> Un
 @Composable
 private fun ModelPicker(vm: Session) {
     var open by remember { mutableStateOf(false) }
+    var showAll by remember { mutableStateOf(false) }
     val current = vm.models.firstOrNull { it.id == vm.model }
     Box {
         Surface(
@@ -262,7 +263,11 @@ private fun ModelPicker(vm: Session) {
                 color = Dim, fontFamily = mono, fontSize = 9.sp,
                 modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp)
             )
-            vm.models.forEach { m ->
+            // Never show more than 5 at once unless expanded; keep the selected model visible even
+            // when it isn't in the first five.
+            val ordered = (listOfNotNull(current) + vm.models.filter { it.id != vm.model }).distinct()
+            val shown = if (showAll) ordered else ordered.take(5)
+            shown.forEach { m ->
                 DropdownMenuItem(
                     text = {
                         Column {
@@ -277,6 +282,15 @@ private fun ModelPicker(vm: Session) {
                 )
             }
             HorizontalDivider(color = Line)
+            if (vm.models.size > 5) DropdownMenuItem(
+                text = {
+                    Text(
+                        if (showAll) "▴ show less" else "▾ show all (${vm.models.size})",
+                        fontFamily = mono, fontSize = 11.sp, color = Orange
+                    )
+                },
+                onClick = { showAll = !showAll }   // toggle in place, keep the menu open
+            )
             DropdownMenuItem(
                 text = { Text("refresh list", fontFamily = mono, fontSize = 11.sp, color = Dim) },
                 onClick = { vm.refreshModels(); open = false }
